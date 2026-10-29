@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "temporary_chats": False,
     "generated_image_max_bytes": 10 * 1024 * 1024,
     "generated_image_max_redirects": 3,
+    "image_edit_crop": True,
     "session_hashes": {},
 }
 

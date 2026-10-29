@@ -23,6 +23,7 @@ from .generated_image import download_generated_image
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
+from .image_ops import ImageOpsUnavailable, composite_crop_edit, prepare_crop_edit
 from .cache import CACHE
 from .rotation import rotation_worker_alive
 from . import __version__
@@ -65,7 +66,7 @@ def _chat_image_prompt(request: dict):
     return None
 
 
-def _generated_image_payload(image, response_format: str):
+def _generated_image_payload(image, response_format: str, transform=None):
     """Resolve an image, falling back to the preview URL if full-size delivery fails."""
     full_size_url = get_full_size_image(image)
     candidates = []
@@ -81,6 +82,8 @@ def _generated_image_payload(image, response_format: str):
         try:
             import base64
             image_bytes, mime = download_generated_image(source_url)
+            if transform is not None:
+                image_bytes, mime = transform(image_bytes, mime)
             encoded = base64.b64encode(image_bytes).decode("ascii")
             if response_format == "url":
                 data = {"url": "data:%s;base64,%s" % (mime, encoded)}
@@ -331,6 +334,32 @@ def _edit_prompt(prompt: str, has_mask: bool) -> str:
         "looks more natural there.\n"
         "- If the requested change cannot fit, keep it inside the transparent region as "
         "much as possible and leave the opaque region untouched.\n\n"
+        "User instruction:\n"
+        + prompt
+    )
+
+
+def _crop_edit_prompt(prompt: str, crop_size: tuple) -> str:
+    width, height = crop_size
+    return (
+        "You are editing a cropped region of a larger image.\n\n"
+        "Image 1 is the source crop. Image 2 is a pixel-aligned edit mask for this crop; "
+        "it is not a style reference and only defines the editable region.\n\n"
+        f"The output must represent exactly this {width}x{height} crop. Do not expand the "
+        "canvas, add borders, or return the surrounding full image. Continue the existing "
+        "scene naturally.\n\n"
+        "Mask rules:\n"
+        "- The transparent region of the mask (alpha = 0) is the ONLY editable area.\n"
+        "- The opaque region of the mask (alpha = 255) must remain completely unchanged.\n"
+        "- Treat partially transparent edge pixels as a natural blend between the edited "
+        "and preserved areas.\n"
+        "- Preserve the crop's framing, perspective, lighting, colors, and all opaque content.\n\n"
+        "Placement rules:\n"
+        "- Put every requested object or change entirely inside the transparent region.\n"
+        "- Scale or adjust the requested subject as needed so it fits completely inside "
+        "that region.\n"
+        "- Do not place the requested subject outside the transparent region, even if it "
+        "looks more natural there.\n\n"
         "User instruction:\n"
         + prompt
     )
@@ -721,20 +750,50 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": str(exc)}}, 400)
             return
 
+        crop_plan = None
+        if mask is not None and CONFIG.get("image_edit_crop", True):
+            try:
+                crop_plan = prepare_crop_edit(image[0], mask[0], image[1])
+            except ImageOpsUnavailable:
+                log("image_edit_crop_fallback reason=imagemagick_unavailable")
+            except ValueError as exc:
+                self.send_json({"error": {"message": str(exc)}}, 400)
+                return
+            except RuntimeError as exc:
+                self.send_json({
+                    "error": {"message": "image edit preparation failed: "
+                                         + safe_error_message(exc, 500)}}, 502)
+                return
+
         if ignored_fields:
             log("image_edit_compat ignored_fields=%s" % ",".join(ignored_fields))
-        attachments = [image]
-        if mask is not None:
-            attachments.append(mask)
+        if crop_plan is not None:
+            attachments = [
+                (crop_plan.crop_image, "image/png", "crop.png"),
+                (crop_plan.crop_mask, "image/png", "mask.png"),
+            ]
+            edit_prompt = _crop_edit_prompt(prompt, crop_plan.crop_size)
+            transform = lambda edited_bytes, edited_mime: composite_crop_edit(
+                image[0], image[1], edited_bytes, edited_mime,
+                crop_plan.crop_mask, crop_plan.crop_box, crop_plan.crop_size,
+            )
+            log("image_edit_crop box=%s size=%s mask_pixels=%d" % (
+                crop_plan.crop_box, crop_plan.crop_size,
+                crop_plan.geometry.transparent_pixels,
+            ))
+        else:
+            attachments = [image]
+            if mask is not None:
+                attachments.append(mask)
+            edit_prompt = _edit_prompt(prompt, mask is not None)
+            transform = None
         try:
             file_refs = _upload_images(attachments)
-            result = generate_image_structured(
-                _edit_prompt(prompt, mask is not None), file_refs=file_refs
-            )
+            result = generate_image_structured(edit_prompt, file_refs=file_refs)
             if not result.images:
                 raise RuntimeError("Gemini returned no generated image metadata")
             data, source_kind, source_url = _generated_image_payload(
-                result.images[0], response_format
+                result.images[0], response_format, transform=transform
             )
             log(
                 "image_edit_result selected_full_size=%s response_format=%s source_host=%s source_path=%s"

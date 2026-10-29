@@ -15,7 +15,8 @@ from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api import gemini, rotation
 from gemini_web2api.cache import CACHE
 from gemini_web2api.gemini import _build_payload
-from gemini_web2api.server import GeminiHandler, ThreadedServer, _classify_response_quality, _edit_prompt
+from gemini_web2api.server import GeminiHandler, ThreadedServer, _classify_response_quality, _crop_edit_prompt, _edit_prompt
+from gemini_web2api.image_ops import ImageOpsUnavailable, choose_crop_box, mask_geometry
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
 
 
@@ -54,6 +55,37 @@ def _png_bytes(width=2, height=2, alpha=True):
         )
 
     header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _mask_png(width=2, height=2, transparent=None):
+    """Build an RGBA PNG with a fully transparent rectangle."""
+    rows = []
+    for y in range(height):
+        pixels = bytearray()
+        for x in range(width):
+            editable = (
+                transparent is not None
+                and transparent[0] <= x < transparent[2]
+                and transparent[1] <= y < transparent[3]
+            )
+            pixels += bytes((255, 0, 0, 0 if editable else 255))
+        rows.append(b"\x00" + bytes(pixels))
+    raw = b"".join(rows)
+
+    def chunk(kind, data):
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data)) + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xffffffff)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", header)
@@ -779,8 +811,11 @@ class StreamingEndpointTests(unittest.TestCase):
             images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
         )
         source = _png_bytes(2, 2, alpha=True)
-        mask = _png_bytes(2, 2, alpha=True)
+        mask = _mask_png(2, 2, (0, 0, 1, 1))
         with mock.patch(
+            "gemini_web2api.server.prepare_crop_edit",
+            side_effect=ImageOpsUnavailable("test fallback"),
+        ), mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
         ) as upload_image, mock.patch(
@@ -843,6 +878,100 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertIn("Do not place the requested subject outside", prompt)
         self.assertTrue(prompt.endswith("User instruction:\nadd a surfer"))
         self.assertEqual(_edit_prompt("add a surfer", False), "add a surfer")
+
+    def test_crop_edit_prompt_is_crop_aware_and_preserves_user_instruction(self):
+        prompt = _crop_edit_prompt("add a surfer", (528, 226))
+        self.assertTrue(prompt.startswith("You are editing a cropped region"))
+        self.assertIn("528x226 crop", prompt)
+        self.assertIn("Do not expand the canvas", prompt)
+        self.assertIn("entirely inside the transparent region", prompt)
+        self.assertTrue(prompt.endswith("User instruction:\nadd a surfer"))
+
+    def test_mask_geometry_returns_transparent_bounds_and_crop_box(self):
+        geometry = mask_geometry(_mask_png(10, 8, (2, 1, 8, 6)))
+        self.assertEqual(geometry.bounds, (2, 1, 8, 6))
+        self.assertEqual(geometry.transparent_pixels, 30)
+        crop = choose_crop_box(geometry.bounds, 100, 100)
+        self.assertLessEqual(crop[0], 2)
+        self.assertLessEqual(crop[1], 1)
+        self.assertGreaterEqual(crop[2], 8)
+        self.assertGreaterEqual(crop[3], 6)
+        with self.assertRaisesRegex(ValueError, "no fully transparent"):
+            mask_geometry(_mask_png(2, 2))
+
+    def test_image_edit_endpoint_uses_crop_and_composite_mode(self):
+        from types import SimpleNamespace
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2, alpha=True)
+        mask = _mask_png(2, 2, (0, 0, 1, 1))
+        plan = SimpleNamespace(
+            crop_image=b"cropped-source",
+            crop_mask=b"cropped-mask",
+            crop_box=(0, 0, 2, 2),
+            crop_size=(2, 2),
+            geometry=SimpleNamespace(transparent_pixels=1),
+        )
+        edited = b"\x89PNG\r\n\x1a\nedited"
+        composited = b"\x89PNG\r\n\x1a\ncomposited"
+        with mock.patch(
+            "gemini_web2api.server.prepare_crop_edit", return_value=plan
+        ), mock.patch(
+            "gemini_web2api.server.upload_image",
+            side_effect=["/uploaded/crop", "/uploaded/mask"],
+        ) as upload_image, mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(edited, "image/png"),
+        ), mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(composited, "image/png"),
+        ) as composite_crop_edit:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "add a surfer", "response_format": "b64_json"},
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            base64.b64decode(json.loads(body)["data"][0]["b64_json"]),
+            composited,
+        )
+        self.assertEqual(upload_image.call_args_list, [
+            mock.call(plan.crop_image, "crop.png", "image/png"),
+            mock.call(plan.crop_mask, "mask.png", "image/png"),
+        ])
+        prompt = generate_image_structured.call_args.args[0]
+        self.assertIn("cropped region", prompt)
+        self.assertIn("2x2 crop", prompt)
+        self.assertTrue(prompt.endswith("User instruction:\nadd a surfer"))
+        composite_crop_edit.assert_called_once_with(
+            source, "image/png", edited, "image/png",
+            plan.crop_mask, plan.crop_box, plan.crop_size,
+        )
+
+    def test_image_edit_endpoint_rejects_mask_without_transparent_pixels(self):
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this"},
+            files={
+                "image": ("source.png", _png_bytes(2, 2), "image/png"),
+                "mask": ("mask.png", _mask_png(2, 2), "image/png"),
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("no fully transparent", json.loads(body)["error"]["message"])
 
     def test_image_edit_endpoint_rejects_invalid_multipart_requests(self):
         status, _, body = self.post_multipart(
