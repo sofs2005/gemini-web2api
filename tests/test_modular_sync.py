@@ -15,7 +15,7 @@ from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api import gemini, rotation
 from gemini_web2api.cache import CACHE
 from gemini_web2api.gemini import _build_payload
-from gemini_web2api.server import GeminiHandler, ThreadedServer, _classify_response_quality
+from gemini_web2api.server import GeminiHandler, ThreadedServer, _classify_response_quality, _edit_prompt
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
 
 
@@ -816,10 +816,33 @@ class StreamingEndpointTests(unittest.TestCase):
         prompt = generate_image_structured.call_args.args[0]
         self.assertIn("replace the sky with a sunset", prompt)
         self.assertIn("edit mask", prompt)
+        self.assertIn("strict masked image edit", prompt)
+        self.assertIn("ONLY editable area", prompt)
+        self.assertIn("must remain completely unchanged", prompt)
+        self.assertIn("not a style reference", prompt)
+        self.assertIn("entirely inside the transparent region", prompt)
+        self.assertTrue(prompt.rstrip().endswith("replace the sky with a sunset"))
         self.assertEqual(
             generate_image_structured.call_args.kwargs["file_refs"],
             [("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")],
         )
+
+    def test_edit_prompt_is_strict_and_preserves_user_instruction(self):
+        prompt = _edit_prompt("add a surfer", True)
+        self.assertTrue(prompt.startswith("You are performing a strict masked image edit."))
+        self.assertIn(
+            "The transparent region of the mask (alpha = 0) is the ONLY editable area.",
+            prompt,
+        )
+        self.assertIn(
+            "The opaque region of the mask (alpha = 255) must remain completely unchanged.",
+            prompt,
+        )
+        self.assertIn("not a style reference", prompt)
+        self.assertIn("entirely inside the transparent region", prompt)
+        self.assertIn("Do not place the requested subject outside", prompt)
+        self.assertTrue(prompt.endswith("User instruction:\nadd a surfer"))
+        self.assertEqual(_edit_prompt("add a surfer", False), "add a surfer")
 
     def test_image_edit_endpoint_rejects_invalid_multipart_requests(self):
         status, _, body = self.post_multipart(

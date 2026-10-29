@@ -310,9 +310,28 @@ def _edit_prompt(prompt: str, has_mask: bool) -> str:
     if not has_mask:
         return prompt
     return (
-        "Edit the first attached image according to the user's instruction below. "
-        "The second attached image is an edit mask: preserve the opaque area and make "
-        "the requested changes in the transparent area.\n\n"
+        "You are performing a strict masked image edit.\n\n"
+        "Image 1 is the source image. Image 2 is a pixel-aligned edit mask; "
+        "it is not a style reference and only defines the editable region.\n\n"
+        "Mask rules:\n"
+        "- The transparent region of the mask (alpha = 0) is the ONLY editable area.\n"
+        "- The opaque region of the mask (alpha = 255) must remain completely unchanged.\n"
+        "- Treat partially transparent edge pixels as a natural blend between the edited "
+        "and preserved areas.\n"
+        "- Do not crop, resize, reframe, rotate, zoom, relight, recolor, or restyle the "
+        "overall image.\n"
+        "- Do not repaint, move, remove, or add anything outside the transparent region.\n"
+        "- Preserve the original framing, camera angle, perspective, lighting, colors, "
+        "and all opaque content exactly as they are.\n\n"
+        "Placement rules:\n"
+        "- Put every requested object or change entirely inside the transparent region.\n"
+        "- Scale or adjust the requested subject as needed so it fits completely inside "
+        "that region.\n"
+        "- Do not place the requested subject outside the transparent region, even if it "
+        "looks more natural there.\n"
+        "- If the requested change cannot fit, keep it inside the transparent region as "
+        "much as possible and leave the opaque region untouched.\n\n"
+        "User instruction:\n"
         + prompt
     )
 
