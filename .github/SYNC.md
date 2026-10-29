@@ -34,12 +34,22 @@ docker pull ghcr.io/sofs2005/gemini-web2api:latest
 
 ## 3. 本机自动更新（飞牛 NAS）
 
-本机容器跑的是 CI 产出的 `ghcr.io/sofs2005/gemini-web2api:latest`，由 watchtower 按 label 自动更新：
+部署文件在飞牛目录，和改造前同一个位置，方便 NAS 端统一管理：
 
-- 部署目录：`/vol1/@appshare/octop-native/data/.octop/agents/TBH9A1/work/gemini-web2api/`
-- `docker compose -f .../docker-compose.yml up -d` 起 `gemini-web2api`（端口 8281→8081）和 `watchtower`
-- watchtower 每 5 分钟检查一次，只更新带 `com.centurylinklabs.watchtower.enable=true` 的容器
-- 配置/凭据仍挂载宿主目录 `/vol1/1000/gemini-web2api/{config.json,cookie.txt,data}`，更新镜像不动数据
+- `/vol1/1000/gemini-web2api/docker-compose.yml`（compose 项目名 `gemini2api`，旧文件备份为 `docker-compose.yml.bak-20261029`）
+- 镜像直接拉 `ghcr.io/sofs2005/gemini-web2api:latest`，**不再 `build: .`**，本机源码不参与运行
+- `watchtower`（`nickfedor/watchtower`，官方 `containrrr` 版客户端 API 太老，在这台机器上起不来）
+  每 5 分钟检查一次，只更新带 `com.centurylinklabs.watchtower.enable=true` 的容器
+- 配置/凭据仍挂载 `/vol1/1000/gemini-web2api/{config.json,cookie.txt,data}`，更新镜像不动数据
+
+该目录属主是 uid 1000（飞牛用户），agent 账号无读权限，需要用 root 容器操作：
+
+```sh
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /vol1/1000/gemini-web2api:/vol1/1000/gemini-web2api \
+  -w /vol1/1000/gemini-web2api \
+  docker:cli compose -f /vol1/1000/gemini-web2api/docker-compose.yml up -d
+```
 
 ## 冲突处理策略
 
