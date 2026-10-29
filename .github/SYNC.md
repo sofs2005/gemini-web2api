@@ -24,9 +24,9 @@ docker pull ghcr.io/sofs2005/gemini-web2api:latest
 - 流程：
   1. `git fetch upstream main`
   2. 上游无新提交 → 直接结束（不产生空提交）
-  3. 有新提交 → `git merge upstream/main`；若冲突则 `-X theirs` 以上游实现为准重试
+  3. 有新提交 → `git rebase upstream/main`，把本仓库唯一的 CI 提交接到上游最新提交之上（历史线性，无合并提交）；冲突则退回 `merge -X theirs`，以上游实现为准
   4. 跑 `pytest` 回归，失败则不同步
-  5. push 到 fork 的 `main`（同时触发 `docker.yml`）
+  5. `push --force-with-lease` 到 fork 的 `main`
   6. 显式 `gh workflow run docker.yml` 兜底，保证 `latest` 一定被重建
 
 改时间：编辑 `cron`（**UTC**，比北京时间减 8 小时）。北京时间 03:30 → `30 19 * * *`。
