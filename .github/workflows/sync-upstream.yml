@@ -40,12 +40,12 @@ jobs:
           git remote add upstream https://github.com/meatRoll/gemini-web2api.git
           git fetch --no-tags upstream main
 
-      - name: Merge upstream main
+      - name: Sync upstream main
         id: merge
         run: |
           set -eu
           if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "上游没有新提交，跳过合并"
+            echo "上游没有新提交，跳过同步"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -53,20 +53,21 @@ jobs:
           echo "即将合入的上游提交："
           git log --oneline --no-decorate HEAD..upstream/main
 
-          if git merge --no-edit upstream/main; then
-            echo "合并成功（无冲突）"
+          # 本地只有 .github/ 下的 CI 文件，rebase 到上游可保持线性历史（不产生合并提交）
+          if git rebase upstream/main; then
+            echo "rebase 成功"
           else
-            echo "::warning::普通合并存在冲突，改用 -X theirs 以上游实现为准重试"
-            git merge --abort || true
+            echo "::warning::rebase 存在冲突，改用 merge -X theirs 以上游实现为准重试"
+            git rebase --abort || true
             if ! git merge --no-edit -X theirs upstream/main; then
               git merge --abort || true
-              echo "::error::自动合并失败，需要人工处理冲突"
+              echo "::error::自动同步失败，需要人工处理冲突"
               exit 1
             fi
           fi
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "合并后版本：$(grep -m1 '__version__' gemini_web2api/__init__.py)"
+          echo "同步后版本：$(grep -m1 '__version__' gemini_web2api/__init__.py)"
 
       - name: Run regression tests
         if: steps.merge.outputs.changed == 'true'
@@ -74,9 +75,9 @@ jobs:
           python3 -m pip install --quiet -r requirements.txt pytest
           python3 -m pytest -q
 
-      - name: Push merged main
+      - name: Push synced main
         if: steps.merge.outputs.changed == 'true'
-        run: git push origin HEAD:main
+        run: git push --force-with-lease origin HEAD:main
 
       - name: Trigger Docker build
         if: steps.merge.outputs.changed == 'true' || inputs.force_rebuild
