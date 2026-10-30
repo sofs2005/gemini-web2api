@@ -812,10 +812,9 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         source = _png_bytes(2, 2, alpha=True)
         mask = _mask_png(2, 2, (0, 0, 1, 1))
-        with mock.patch(
-            "gemini_web2api.server.prepare_crop_edit",
-            side_effect=ImageOpsUnavailable("test fallback"),
-        ), mock.patch(
+        edited = b"\x89PNG\r\n\x1a\n"
+        composited = b"\x89PNG\r\n\x1a\ncomposited"
+        with mock.patch.dict(CONFIG, {"image_edit_crop": False}), mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
         ) as upload_image, mock.patch(
@@ -825,8 +824,11 @@ class StreamingEndpointTests(unittest.TestCase):
             "gemini_web2api.server.get_full_size_image", return_value=None
         ), mock.patch(
             "gemini_web2api.server.download_generated_image",
-            return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
-        ):
+            return_value=(edited, "image/png"),
+        ), mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(composited, "image/png"),
+        ) as composite_crop_edit:
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
                 fields={
@@ -842,7 +844,10 @@ class StreamingEndpointTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
+        self.assertEqual(
+            base64.b64decode(json.loads(body)["data"][0]["b64_json"]),
+            composited,
+        )
         self.assertEqual(upload_image.call_args_list, [
             mock.call(source, "source.png", "image/png"),
             mock.call(mask, "mask.png", "image/png"),
@@ -861,6 +866,10 @@ class StreamingEndpointTests(unittest.TestCase):
             generate_image_structured.call_args.kwargs["file_refs"],
             [("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")],
         )
+        composite_crop_edit.assert_called_once_with(
+            source, "image/png", edited, "image/png", mask,
+            (0, 0, 2, 2), (2, 2),
+        )
 
     def test_edit_prompt_is_strict_and_preserves_user_instruction(self):
         prompt = _edit_prompt("add a surfer", True)
@@ -875,6 +884,10 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         self.assertIn("not a style reference", prompt)
         self.assertIn("entirely inside the transparent region", prompt)
+        self.assertIn("hard-stencil", prompt)
+        self.assertIn("pixel-for-pixel copy", prompt)
+        self.assertIn("If any answer is no, revise the image", prompt)
+        self.assertIn("return Image 1 unchanged", prompt)
         self.assertIn("Do not place the requested subject outside", prompt)
         self.assertTrue(prompt.endswith("User instruction:\nadd a surfer"))
         self.assertEqual(_edit_prompt("add a surfer", False), "add a surfer")
@@ -917,7 +930,7 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         edited = b"\x89PNG\r\n\x1a\nedited"
         composited = b"\x89PNG\r\n\x1a\ncomposited"
-        with mock.patch(
+        with mock.patch.dict(CONFIG, {"image_edit_crop": True}), mock.patch(
             "gemini_web2api.server.prepare_crop_edit", return_value=plan
         ), mock.patch(
             "gemini_web2api.server.upload_image",

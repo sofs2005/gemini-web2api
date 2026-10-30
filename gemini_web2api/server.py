@@ -23,7 +23,9 @@ from .generated_image import download_generated_image
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
-from .image_ops import ImageOpsUnavailable, composite_crop_edit, prepare_crop_edit
+from .image_ops import (
+    ImageOpsUnavailable, composite_crop_edit, mask_geometry, prepare_crop_edit,
+)
 from .cache import CACHE
 from .rotation import rotation_worker_alive
 from . import __version__
@@ -313,27 +315,50 @@ def _edit_prompt(prompt: str, has_mask: bool) -> str:
     if not has_mask:
         return prompt
     return (
-        "You are performing a strict masked image edit.\n\n"
-        "Image 1 is the source image. Image 2 is a pixel-aligned edit mask; "
-        "it is not a style reference and only defines the editable region.\n\n"
-        "Mask rules:\n"
+        "You are performing a strict masked image edit. "
+        "This is a hard-stencil edit, not a style suggestion, and the mask is a "
+        "pixel-level lock.\n\n"
+        "Image 1 is the source image. Image 2 is the edit mask. "
+        "It is a location reference, not a style reference.\n\n"
+        "Mask semantics:\n"
         "- The transparent region of the mask (alpha = 0) is the ONLY editable area.\n"
         "- The opaque region of the mask (alpha = 255) must remain completely unchanged.\n"
-        "- Treat partially transparent edge pixels as a natural blend between the edited "
-        "and preserved areas.\n"
-        "- Do not crop, resize, reframe, rotate, zoom, relight, recolor, or restyle the "
-        "overall image.\n"
-        "- Do not repaint, move, remove, or add anything outside the transparent region.\n"
-        "- Preserve the original framing, camera angle, perspective, lighting, colors, "
-        "and all opaque content exactly as they are.\n\n"
-        "Placement rules:\n"
-        "- Put every requested object or change entirely inside the transparent region.\n"
-        "- Scale or adjust the requested subject as needed so it fits completely inside "
-        "that region.\n"
-        "- Do not place the requested subject outside the transparent region, even if it "
+        "- Partially transparent edge pixels are only for a natural boundary blend.\n"
+        "- If your viewer renders transparency as black, white, or a checkerboard, "
+        "the region that differs from the opaque background is the editable area.\n\n"
+        "HARD RULES - all must be true:\n"
+        "1. The output must keep the exact dimensions, framing, camera angle, perspective, "
+        "crop, and composition of Image 1.\n"
+        "2. Outside the transparent region, the output must be a pixel-for-pixel copy of "
+        "Image 1. Do not redraw, relight, recolor, regrade, denoise, sharpen, blur, or "
+        "restyle any opaque pixel.\n"
+        "3. Do not regenerate, extend, or reimagine anything outside the transparent region: "
+        "not the background, scenery, sky, water, ground, buildings, props, horizon, "
+        "weather, or lighting.\n"
+        "4. The only visible difference between Image 1 and the output must be inside the "
+        "transparent region.\n"
+        "5. Put the requested subject entirely inside the transparent region. Its full "
+        "bounding box, including hair, hands, feet, board, spray, and shadow, must be inside. "
+        "No part may cross into the opaque region.\n"
+        "6. Do not move the subject to a more natural location. Do not choose a different "
+        "wave or another part of the image. The transparent region is the only allowed "
+        "location.\n"
+        "7. Do not place the requested subject outside the transparent region, even if it "
         "looks more natural there.\n"
-        "- If the requested change cannot fit, keep it inside the transparent region as "
-        "much as possible and leave the opaque region untouched.\n\n"
+        "8. If the subject cannot fit, make it smaller. If it still cannot fit, leave the "
+        "transparent region unchanged. Never place it outside.\n"
+        "9. Inside the transparent region, preserve the existing background as much as "
+        "possible. Match the surrounding water texture, foam, perspective, lighting, color, "
+        "and weather. Do not add a rectangular patch, border, frame, vignette, or visible "
+        "seam.\n"
+        "10. Do not add text, watermarks, logos, borders, or extra objects. Do not copy the "
+        "mask image's colors into the output.\n\n"
+        "Before you answer, verify:\n"
+        "- Is every changed pixel inside the transparent region?\n"
+        "- Is the opaque region unchanged?\n"
+        "- Is the requested subject fully inside the transparent region?\n"
+        "If any answer is no, revise the image. If you cannot satisfy all rules, return "
+        "Image 1 unchanged.\n\n"
         "User instruction:\n"
         + prompt
     )
@@ -751,19 +776,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         crop_plan = None
-        if mask is not None and CONFIG.get("image_edit_crop", True):
-            try:
-                crop_plan = prepare_crop_edit(image[0], mask[0], image[1])
-            except ImageOpsUnavailable:
-                log("image_edit_crop_fallback reason=imagemagick_unavailable")
-            except ValueError as exc:
-                self.send_json({"error": {"message": str(exc)}}, 400)
-                return
-            except RuntimeError as exc:
-                self.send_json({
-                    "error": {"message": "image edit preparation failed: "
-                                         + safe_error_message(exc, 500)}}, 502)
-                return
+        mask_geometry_info = None
+        if mask is not None:
+            if CONFIG.get("image_edit_crop", False):
+                try:
+                    crop_plan = prepare_crop_edit(image[0], mask[0], image[1])
+                except ImageOpsUnavailable:
+                    log("image_edit_crop_fallback reason=imagemagick_unavailable")
+                except ValueError as exc:
+                    self.send_json({"error": {"message": str(exc)}}, 400)
+                    return
+                except RuntimeError as exc:
+                    self.send_json({
+                        "error": {"message": "image edit preparation failed: "
+                                             + safe_error_message(exc, 500)}}, 502)
+                    return
+            if crop_plan is None:
+                try:
+                    mask_geometry_info = mask_geometry(mask[0])
+                except ValueError as exc:
+                    self.send_json({"error": {"message": str(exc)}}, 400)
+                    return
 
         if ignored_fields:
             log("image_edit_compat ignored_fields=%s" % ",".join(ignored_fields))
@@ -781,11 +814,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 crop_plan.crop_box, crop_plan.crop_size,
                 crop_plan.geometry.transparent_pixels,
             ))
+        elif mask is not None:
+            width = mask_geometry_info.width
+            height = mask_geometry_info.height
+            full_box = (0, 0, width, height)
+            full_size = (width, height)
+            attachments = [image, mask]
+            edit_prompt = _edit_prompt(prompt, True)
+            transform = lambda edited_bytes, edited_mime: composite_crop_edit(
+                image[0], image[1], edited_bytes, edited_mime,
+                mask[0], full_box, full_size,
+            )
+            log("image_edit_mode=prompt_composite size=%s mask_pixels=%d" % (
+                full_size, mask_geometry_info.transparent_pixels,
+            ))
         else:
             attachments = [image]
-            if mask is not None:
-                attachments.append(mask)
-            edit_prompt = _edit_prompt(prompt, mask is not None)
+            edit_prompt = prompt
             transform = None
         try:
             file_refs = _upload_images(attachments)
