@@ -495,3 +495,94 @@ def thumbnail_mask_stats(source_bytes, source_mime, edited_bytes, edited_mime, m
     outside = outside_total / (outside_samples * 3) if outside_samples >= 64 else 0.0
     inside = inside_total / (inside_samples * 3) if inside_samples >= 64 else 0.0
     return outside, inside
+
+
+@dataclass(frozen=True)
+class MarkerEditPlan:
+    """Locator image and marker alpha for a three-image masked edit."""
+
+    locator_image: bytes
+    marker_alpha: bytes
+
+
+_MARKER_COLOR = "#ff2222"
+_MARKER_STROKE_RADIUS = 3      # half-width of the outline drawn on the boundary
+_MARKER_REMOVAL_RADIUS = 3      # extra dilation so JPEG bleed is covered too
+
+
+def build_marker_locator(source_bytes, source_mime, mask_bytes,
+                         color=_MARKER_COLOR) -> MarkerEditPlan:
+    """Draw a thin outline on the mask boundary and return locator assets.
+
+    Gemini Web copies the colors of any black/white alpha mask into the edited
+    region, so the mask itself is never sent. Instead the model receives this
+    locator: the source photo with a red outline around the editable area. The
+    outline is what the server later removes, so its alpha is returned too.
+    """
+    width, height, alpha = _png_alpha(mask_bytes)
+    if alpha.count(0) == 0:
+        raise ValueError("mask has no fully transparent editable region")
+
+    with tempfile.TemporaryDirectory(prefix="gemini-locator-") as temp_name:
+        temp_dir = Path(temp_name)
+        source_path = temp_dir / ("source" + _mime_suffix(source_mime))
+        mask_path = temp_dir / "mask.png"
+        binary_path = temp_dir / "binary.png"
+        inner_path = temp_dir / "inner.png"
+        outer_path = temp_dir / "outer.png"
+        stroke_path = temp_dir / "stroke.png"
+        marker_alpha_path = temp_dir / "marker-alpha.png"
+        stroke_red_path = temp_dir / "stroke-red.png"
+        locator_path = temp_dir / "locator.png"
+        source_path.write_bytes(source_bytes)
+        mask_path.write_bytes(mask_bytes)
+
+        _run_magick([mask_path, "-alpha", "extract", "-threshold", "50%",
+                     "-depth", "8", binary_path])
+        _run_magick([binary_path, "-morphology", "Erode",
+                     "Diamond:%d" % _MARKER_STROKE_RADIUS, "-depth", "8", inner_path])
+        _run_magick([binary_path, "-morphology", "Dilate",
+                     "Diamond:%d" % _MARKER_STROKE_RADIUS, "-depth", "8", outer_path])
+        _run_magick([outer_path, inner_path, "-compose", "Difference",
+                     "-composite", "-depth", "8", stroke_path])
+        # Removal alpha is wider than the drawn stroke so the blur/JPEG bleed
+        # around it is restored from the source as well.
+        _run_magick([stroke_path, "-morphology", "Dilate",
+                     "Diamond:%d" % _MARKER_REMOVAL_RADIUS,
+                     "-blur", "0x1", "-depth", "8", marker_alpha_path])
+        _run_magick(["-size", "%dx%d" % (width, height), "xc:" + color,
+                     stroke_path, "-alpha", "off",
+                     "-compose", "CopyOpacity", "-composite", stroke_red_path])
+        _run_magick([source_path, stroke_red_path,
+                     "-compose", "Over", "-composite", locator_path])
+
+        return MarkerEditPlan(
+            locator_image=locator_path.read_bytes(),
+            marker_alpha=marker_alpha_path.read_bytes(),
+        )
+
+
+def strip_edit_marker(edited_bytes, edited_mime, source_bytes, source_mime,
+                      marker_alpha) -> tuple:
+    """Restore the locator outline (and its JPEG bleed) from the source photo."""
+    output_mime = "image/jpeg" if edited_mime == "image/jpeg" else "image/png"
+    with tempfile.TemporaryDirectory(prefix="gemini-unmark-") as temp_name:
+        temp_dir = Path(temp_name)
+        edited_path = temp_dir / ("edited" + _mime_suffix(edited_mime))
+        source_path = temp_dir / ("source" + _mime_suffix(source_mime))
+        alpha_path = temp_dir / "marker-alpha.png"
+        patch_path = temp_dir / "source-patch.png"
+        output_path = temp_dir / ("output" + _mime_suffix(output_mime))
+        edited_path.write_bytes(edited_bytes)
+        source_path.write_bytes(source_bytes)
+        alpha_path.write_bytes(marker_alpha)
+
+        _run_magick([source_path, alpha_path, "-alpha", "off",
+                     "-compose", "CopyOpacity", "-composite", patch_path])
+        if output_mime == "image/jpeg":
+            _run_magick([edited_path, patch_path, "-compose", "Over",
+                         "-composite", "-quality", "95", output_path])
+        else:
+            _run_magick([edited_path, patch_path, "-compose", "Over",
+                         "-composite", output_path])
+        return output_path.read_bytes(), output_mime

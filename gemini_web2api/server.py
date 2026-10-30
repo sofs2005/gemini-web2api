@@ -25,8 +25,8 @@ from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_too
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
 from .image_ops import (
-    ImageOpsUnavailable, composite_crop_edit, mask_geometry, prepare_crop_edit,
-    thumbnail_mask_stats,
+    ImageOpsUnavailable, build_marker_locator, composite_crop_edit, mask_geometry,
+    prepare_crop_edit, strip_edit_marker, thumbnail_mask_stats,
 )
 from .cache import CACHE
 from .rotation import rotation_worker_alive
@@ -351,20 +351,38 @@ def _selection_description(geometry) -> str:
     )
 
 
-def _edit_prompt(prompt: str, geometry=None) -> str:
+def _edit_prompt(prompt: str, geometry=None, locator: bool = False) -> str:
     if geometry is None:
         return prompt
+    if locator:
+        images = (
+            "Image 1 is the source image.\n"
+            "Image 2 is the same photo with a thin red outline around the editable "
+            "area. The outline is a locator, not part of the scene: never copy its "
+            "red pixels and never paint a shape that follows it.\n"
+            "Image 3 is the same photo again without any marker, for reference.\n\n"
+        )
+        locator_rule = (
+            "- Do not add anything outside the red outline, even if it looks more "
+            "natural there.\n"
+        )
+    else:
+        images = (
+            "Image 1 is the source image. Image 2 is a selection mask: the transparent "
+            "area marks the only pixels you may change. The mask is a location "
+            "reference only.\n\n"
+        )
+        locator_rule = ""
     return (
         "You are editing one small selected area of Image 1.\n\n"
-        "Image 1 is the source image. Image 2 is a selection mask: the transparent "
-        "area marks the only pixels you may change. The mask is a location reference "
-        "only.\n\n"
-        "Where the selection is:\n"
+        + images
+        + "Where the selection is:\n"
         + _selection_description(geometry)
         + "\n\n"
         "How to edit:\n"
         "- Make the requested change inside the selected area only.\n"
-        "- Change only the pixels needed for that content. Leave the rest of the "
+        + locator_rule
+        + "- Change only the pixels needed for that content. Leave the rest of the "
         "selected area's original texture intact: existing grain, streaks, fog, spray, "
         "color and lighting must continue unchanged inside the selection.\n"
         "- The change must look like a local retouch of Image 1, not like a patch, "
@@ -846,6 +864,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 (crop_plan.crop_mask, "image/png", "mask.png"),
             ]
             edit_prompt = _crop_edit_prompt(prompt, crop_plan.crop_size)
+            strip_marker = None
             transform = lambda edited_bytes, edited_mime: composite_crop_edit(
                 image[0], image[1], edited_bytes, edited_mime,
                 crop_plan.crop_mask, crop_plan.crop_box, crop_plan.crop_size,
@@ -859,21 +878,51 @@ class GeminiHandler(BaseHTTPRequestHandler):
             height = mask_geometry_info.height
             full_box = (0, 0, width, height)
             full_size = (width, height)
-            attachments = [image, mask]
-            edit_prompt = _edit_prompt(prompt, mask_geometry_info)
+            locator_plan = None
+            if CONFIG.get("image_edit_locator", True):
+                try:
+                    locator_plan = build_marker_locator(image[0], image[1], mask[0])
+                except ImageOpsUnavailable:
+                    log("image_edit_locator_fallback reason=imagemagick_unavailable")
+                except (RuntimeError, ValueError) as exc:
+                    log("image_edit_locator_fallback reason=%s" % type(exc).__name__)
+            if locator_plan is not None:
+                # Gemini copies the colors of an alpha mask into the edit, so the
+                # mask stays server-side. The locator and a clean copy of the
+                # source go along with the original image instead.
+                attachments = [
+                    image,
+                    (locator_plan.locator_image, "image/png", "locator.png"),
+                    image,
+                ]
+                edit_prompt = _edit_prompt(prompt, mask_geometry_info, locator=True)
+                strip_marker = (
+                    lambda edited_bytes, edited_mime: strip_edit_marker(
+                        edited_bytes, edited_mime, image[0], image[1],
+                        locator_plan.marker_alpha,
+                    )
+                )
+                log("image_edit_mode=locator_composite size=%s mask_pixels=%d" % (
+                    full_size, mask_geometry_info.transparent_pixels,
+                ))
+            else:
+                attachments = [image, mask]
+                edit_prompt = _edit_prompt(prompt, mask_geometry_info)
+                strip_marker = None
+                log("image_edit_mode=prompt_composite size=%s mask_pixels=%d" % (
+                    full_size, mask_geometry_info.transparent_pixels,
+                ))
             transform = lambda edited_bytes, edited_mime: composite_crop_edit(
                 image[0], image[1], edited_bytes, edited_mime,
                 mask[0], full_box, full_size,
             )
             drift_limit = float(CONFIG.get("image_edit_drift_limit", 40.0))
-            min_change = float(CONFIG.get("image_edit_min_change", 12.0))
-            log("image_edit_mode=prompt_composite size=%s mask_pixels=%d" % (
-                full_size, mask_geometry_info.transparent_pixels,
-            ))
+            min_change = float(CONFIG.get("image_edit_min_change", 8.0))
         else:
             attachments = [image]
             edit_prompt = prompt
             transform = None
+            strip_marker = None
         attempts = 1
         if drift_limit is not None:
             attempts = max(1, min(3, int(CONFIG.get("image_edit_attempts", 2))))
@@ -883,12 +932,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             best_rank = None
             drift = change = None
             for attempt in range(1, attempts + 1):
-                result = generate_image_structured(edit_prompt, file_refs=file_refs)
+                attempt_prompt = edit_prompt
+                if attempt > 1:
+                    # Re-sending the identical prompt tends to reproduce the same
+                    # no-op. Nudge the model to actually perform the edit.
+                    attempt_prompt += (
+                        "\n\nDo not return the photo unchanged. Make the requested "
+                        "change inside the selected area now."
+                    )
+                result = generate_image_structured(attempt_prompt, file_refs=file_refs)
                 if not result.images:
                     raise RuntimeError("Gemini returned no generated image metadata")
                 edited_bytes, edited_mime, source_kind, source_url = (
                     _download_generated_image_bytes(result.images[0])
                 )
+                if strip_marker is not None:
+                    try:
+                        edited_bytes, edited_mime = strip_marker(edited_bytes, edited_mime)
+                    except ImageOpsUnavailable:
+                        log("image_edit_marker_strip_failed reason=imagemagick_unavailable")
+                    except (RuntimeError, ValueError) as exc:
+                        log("image_edit_marker_strip_failed reason=%s" % type(exc).__name__)
                 stats = None
                 if drift_limit is not None:
                     try:

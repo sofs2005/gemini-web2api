@@ -814,7 +814,7 @@ class StreamingEndpointTests(unittest.TestCase):
         mask = _mask_png(2, 2, (0, 0, 1, 1))
         edited = b"\x89PNG\r\n\x1a\n"
         composited = b"\x89PNG\r\n\x1a\ncomposited"
-        with mock.patch.dict(CONFIG, {"image_edit_crop": False}), mock.patch(
+        with mock.patch.dict(CONFIG, {"image_edit_crop": False, "image_edit_locator": False}), mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
         ) as upload_image, mock.patch(
@@ -877,6 +877,92 @@ class StreamingEndpointTests(unittest.TestCase):
             (0, 0, 2, 2), (2, 2),
         )
 
+
+    def test_image_edit_endpoint_uses_marker_locator(self):
+        from types import SimpleNamespace
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2, alpha=True)
+        mask = _mask_png(2, 2, (0, 0, 1, 1))
+        plan = SimpleNamespace(locator_image=b"\x89PNG\r\n\x1a\nlocator",
+                               marker_alpha=b"\x89PNG\r\n\x1a\nalpha")
+        raw = b"\x89PNG\r\n\x1a\nraw"
+        stripped = b"\x89PNG\r\n\x1a\nstripped"
+        composited = b"\x89PNG\r\n\x1a\ncomposited"
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_locator": True,
+        }), mock.patch(
+            "gemini_web2api.server.build_marker_locator", return_value=plan
+        ) as build_marker_locator, mock.patch(
+            "gemini_web2api.server.upload_image",
+            side_effect=["/uploaded/source", "/uploaded/locator", "/uploaded/reference"],
+        ) as upload_image, mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(raw, "image/png"),
+        ), mock.patch(
+            "gemini_web2api.server.strip_edit_marker",
+            return_value=(stripped, "image/png"),
+        ) as strip_edit_marker, mock.patch(
+            "gemini_web2api.server.thumbnail_mask_stats", return_value=(3.0, 20.0),
+        ) as thumbnail_mask_stats, mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(composited, "image/png"),
+        ) as composite_crop_edit:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            base64.b64decode(json.loads(body)["data"][0]["b64_json"]), composited
+        )
+        build_marker_locator.assert_called_once_with(source, "image/png", mask)
+        self.assertEqual(upload_image.call_args_list, [
+            mock.call(source, "source.png", "image/png"),
+            mock.call(plan.locator_image, "locator.png", "image/png"),
+            mock.call(source, "source.png", "image/png"),
+        ])
+        prompt = generate_image_structured.call_args.args[0]
+        self.assertIn("thin red outline", prompt)
+        self.assertIn("Image 3 is the same photo again", prompt)
+        self.assertIn("Do not add anything outside the red outline", prompt)
+        strip_edit_marker.assert_called_once_with(
+            raw, "image/png", source, "image/png", plan.marker_alpha
+        )
+        thumbnail_mask_stats.assert_called_once_with(
+            source, "image/png", stripped, "image/png", mask
+        )
+        composite_crop_edit.assert_called_once_with(
+            source, "image/png", stripped, "image/png", mask,
+            (0, 0, 2, 2), (2, 2),
+        )
+
+    def test_image_edit_prompt_mentions_locator(self):
+        from types import SimpleNamespace
+
+        geometry = SimpleNamespace(width=100, height=100, bounds=(10, 10, 40, 40))
+        prompt = _edit_prompt("add a gull", geometry, locator=True)
+        self.assertIn("thin red outline", prompt)
+        self.assertIn("never copy its red pixels", prompt)
+        self.assertIn("Image 3 is the same photo again", prompt)
+        self.assertIn("Do not add anything outside the red outline", prompt)
+        legacy = _edit_prompt("add a gull", geometry)
+        self.assertIn("selection mask", legacy)
+        self.assertNotIn("Image 3", legacy)
+
     def test_image_edit_retries_when_mask_drift_is_high(self):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
 
@@ -923,6 +1009,10 @@ class StreamingEndpointTests(unittest.TestCase):
             composited,
         )
         self.assertEqual(generate_image_structured.call_count, 2)
+        self.assertIn(
+            "Make the requested change inside the selected area now",
+            generate_image_structured.call_args_list[1].args[0],
+        )
         composite_crop_edit.assert_called_once_with(
             source, "image/png", clean, "image/png", mask,
             (0, 0, 2, 2), (2, 2),
