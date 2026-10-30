@@ -826,8 +826,8 @@ class StreamingEndpointTests(unittest.TestCase):
             "gemini_web2api.server.download_generated_image",
             return_value=(edited, "image/png"),
         ), mock.patch(
-            "gemini_web2api.server.thumbnail_drift", return_value=3.0,
-        ) as thumbnail_drift, mock.patch(
+            "gemini_web2api.server.thumbnail_mask_stats", return_value=(3.0, 30.0),
+        ) as thumbnail_mask_stats, mock.patch(
             "gemini_web2api.server.composite_crop_edit",
             return_value=(composited, "image/png"),
         ) as composite_crop_edit:
@@ -869,7 +869,7 @@ class StreamingEndpointTests(unittest.TestCase):
             generate_image_structured.call_args.kwargs["file_refs"],
             [("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")],
         )
-        thumbnail_drift.assert_called_once_with(
+        thumbnail_mask_stats.assert_called_once_with(
             source, "image/png", edited, "image/png", mask
         )
         composite_crop_edit.assert_called_once_with(
@@ -903,7 +903,7 @@ class StreamingEndpointTests(unittest.TestCase):
             "gemini_web2api.server.download_generated_image",
             side_effect=[(drifted, "image/png"), (clean, "image/png")],
         ), mock.patch(
-            "gemini_web2api.server.thumbnail_drift", side_effect=[40.0, 4.0],
+            "gemini_web2api.server.thumbnail_mask_stats", side_effect=[(45.0, 30.0), (4.0, 30.0)],
         ), mock.patch(
             "gemini_web2api.server.composite_crop_edit",
             return_value=(composited, "image/png"),
@@ -928,7 +928,7 @@ class StreamingEndpointTests(unittest.TestCase):
             (0, 0, 2, 2), (2, 2),
         )
 
-    def test_image_edit_keeps_least_drifted_attempt(self):
+    def test_image_edit_prefers_attempt_that_changes_selection(self):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
 
         generated = GenerationResult(
@@ -954,7 +954,7 @@ class StreamingEndpointTests(unittest.TestCase):
             "gemini_web2api.server.download_generated_image",
             side_effect=[(first, "image/png"), (second, "image/png")],
         ), mock.patch(
-            "gemini_web2api.server.thumbnail_drift", side_effect=[30.0, 45.0],
+            "gemini_web2api.server.thumbnail_mask_stats", side_effect=[(3.0, 2.0), (60.0, 40.0)],
         ), mock.patch(
             "gemini_web2api.server.composite_crop_edit",
             return_value=(composited, "image/png"),
@@ -970,7 +970,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         composite_crop_edit.assert_called_once_with(
-            source, "image/png", first, "image/png", mask,
+            source, "image/png", second, "image/png", mask,
             (0, 0, 2, 2), (2, 2),
         )
 

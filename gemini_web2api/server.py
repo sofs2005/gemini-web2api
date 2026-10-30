@@ -26,7 +26,7 @@ from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prom
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
 from .image_ops import (
     ImageOpsUnavailable, composite_crop_edit, mask_geometry, prepare_crop_edit,
-    thumbnail_drift,
+    thumbnail_mask_stats,
 )
 from .cache import CACHE
 from .rotation import rotation_worker_alive
@@ -95,6 +95,18 @@ def _download_generated_image_bytes(image):
                 log("image_generation_fallback from=%s to=%s error_type=%s" % (
                     source_kind, candidates[index + 1][0], type(exc).__name__))
     raise last_error
+
+
+def _edit_attempt_rank(drift: float, change: float, drift_limit: float, min_change: float):
+    """Rank a raw edit attempt; lower is better.
+
+    An attempt that both keeps the frame anchored and changes the selection
+    wins; its drift decides the order. When no attempt satisfies both, the
+    attempt that at least performed the edit wins.
+    """
+    if drift <= drift_limit and change >= min_change:
+        return (0, drift)
+    return (1, -change)
 
 
 def _generated_image_payload(image, response_format: str, transform=None):
@@ -827,6 +839,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if ignored_fields:
             log("image_edit_compat ignored_fields=%s" % ",".join(ignored_fields))
         drift_limit = None
+        min_change = 0.0
         if crop_plan is not None:
             attachments = [
                 (crop_plan.crop_image, "image/png", "crop.png"),
@@ -852,7 +865,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 image[0], image[1], edited_bytes, edited_mime,
                 mask[0], full_box, full_size,
             )
-            drift_limit = float(CONFIG.get("image_edit_drift_limit", 18.0))
+            drift_limit = float(CONFIG.get("image_edit_drift_limit", 40.0))
+            min_change = float(CONFIG.get("image_edit_min_change", 12.0))
             log("image_edit_mode=prompt_composite size=%s mask_pixels=%d" % (
                 full_size, mask_geometry_info.transparent_pixels,
             ))
@@ -866,6 +880,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = _upload_images(attachments)
             best = None
+            best_rank = None
+            drift = change = None
             for attempt in range(1, attempts + 1):
                 result = generate_image_structured(edit_prompt, file_refs=file_refs)
                 if not result.images:
@@ -873,24 +889,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 edited_bytes, edited_mime, source_kind, source_url = (
                     _download_generated_image_bytes(result.images[0])
                 )
-                drift = None
+                stats = None
                 if drift_limit is not None:
                     try:
-                        drift = thumbnail_drift(
+                        stats = thumbnail_mask_stats(
                             image[0], image[1], edited_bytes, edited_mime, mask[0]
                         )
                     except ImageOpsUnavailable:
-                        drift = None
+                        stats = None
                     except (RuntimeError, ValueError) as exc:
-                        log("image_edit_drift_unavailable error_type=%s" % type(exc).__name__)
-                if best is None or (drift is not None and (best[0] is None or drift < best[0])):
-                    best = (drift, edited_bytes, edited_mime, source_kind, source_url)
-                if drift is not None:
-                    log("image_edit_attempt attempt=%d/%d mask_drift=%.1f" % (
-                        attempt, attempts, drift))
-                if drift is None or drift <= drift_limit or attempt == attempts:
+                        log("image_edit_stats_unavailable error_type=%s" % type(exc).__name__)
+                if stats is not None:
+                    drift, change = stats
+                    rank = _edit_attempt_rank(drift, change, drift_limit, min_change)
+                    if best is None or rank < best_rank:
+                        best_rank = rank
+                        best = (drift, change, edited_bytes, edited_mime,
+                                source_kind, source_url)
+                    log("image_edit_attempt attempt=%d/%d mask_drift=%.1f "
+                        "selection_change=%.1f" % (attempt, attempts, drift, change))
+                    if rank[0] == 0:
+                        break
+                elif best is None:
+                    best = (None, None, edited_bytes, edited_mime,
+                            source_kind, source_url)
                     break
-            drift, edited_bytes, edited_mime, source_kind, source_url = best
+                if attempt == attempts:
+                    break
+            if best is None:
+                raise RuntimeError("Gemini returned no generated image metadata")
+            drift, change, edited_bytes, edited_mime, source_kind, source_url = best
             if transform is not None:
                 edited_bytes, edited_mime = transform(edited_bytes, edited_mime)
             encoded = base64.b64encode(edited_bytes).decode("ascii")
@@ -900,10 +928,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 data = {"b64_json": encoded}
             log(
                 "image_edit_result selected_full_size=%s response_format=%s "
-                "mask_drift=%s source_host=%s source_path=%s"
+                "mask_drift=%s selection_change=%s source_host=%s source_path=%s"
                 % (
                     source_kind == "full_size", response_format,
                     "n/a" if drift is None else "%.1f" % drift,
+                    "n/a" if change is None else "%.1f" % change,
                     (urlsplit(source_url).hostname or "-"),
                     (urlsplit(source_url).path or "/"),
                 )

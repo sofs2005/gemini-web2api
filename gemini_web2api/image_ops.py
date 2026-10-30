@@ -441,13 +441,18 @@ _DRIFT_GRID = 128
 _DRIFT_TIMEOUT_SEC = 60
 
 
-def thumbnail_drift(source_bytes, source_mime, edited_bytes, edited_mime, mask_bytes,
-                    grid=_DRIFT_GRID):
-    """Mean per-channel difference outside the mask on a downscaled thumbnail.
+def thumbnail_mask_stats(source_bytes, source_mime, edited_bytes, edited_mime, mask_bytes,
+                         grid=_DRIFT_GRID):
+    """Compare a thumbnail of the raw model output against the source.
 
-    Returns a 0-255 score. Values near 0 mean the model returned the original
-    pixels; large values mean it repainted the whole frame. Raises
-    ImageOpsUnavailable when ImageMagick is missing.
+    Returns ``(outside_drift, inside_change)`` on a 0-255 scale:
+
+    - ``outside_drift`` is the mean per-channel difference where the mask is
+      opaque. High values mean Gemini repainted the whole frame instead of
+      editing the selection.
+    - ``inside_change`` is the mean per-channel difference where the mask is
+      fully transparent. Values near zero mean the model returned the original
+      pixels and ignored the edit.
     """
     with tempfile.TemporaryDirectory(prefix="gemini-drift-") as temp_name:
         temp_dir = Path(temp_name)
@@ -469,21 +474,24 @@ def thumbnail_drift(source_bytes, source_mime, edited_bytes, edited_mime, mask_b
 
     expected = grid * grid
     if len(source_rgb) < expected * 3 or len(edited_rgb) < expected * 3:
-        raise RuntimeError("ImageMagick returned incomplete drift thumbnails")
+        raise RuntimeError("ImageMagick returned incomplete comparison thumbnails")
     if len(mask_alpha) < expected:
         raise RuntimeError("ImageMagick returned an incomplete mask thumbnail")
 
-    total = 0
-    samples = 0
+    outside_total = outside_samples = 0
+    inside_total = inside_samples = 0
     for index in range(expected):
-        # Only compare pixels the mask says must stay untouched.
-        if mask_alpha[index] < 250:
-            continue
+        alpha = mask_alpha[index]
         offset = index * 3
-        total += (abs(source_rgb[offset] - edited_rgb[offset])
-                  + abs(source_rgb[offset + 1] - edited_rgb[offset + 1])
-                  + abs(source_rgb[offset + 2] - edited_rgb[offset + 2]))
-        samples += 1
-    if samples < 64:
-        return 0.0
-    return total / (samples * 3)
+        delta = (abs(source_rgb[offset] - edited_rgb[offset])
+                 + abs(source_rgb[offset + 1] - edited_rgb[offset + 1])
+                 + abs(source_rgb[offset + 2] - edited_rgb[offset + 2]))
+        if alpha >= 250:
+            outside_total += delta
+            outside_samples += 1
+        elif alpha == 0:
+            inside_total += delta
+            inside_samples += 1
+    outside = outside_total / (outside_samples * 3) if outside_samples >= 64 else 0.0
+    inside = inside_total / (inside_samples * 3) if inside_samples >= 64 else 0.0
+    return outside, inside

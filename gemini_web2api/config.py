@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "image_edit_crop": False,
     "image_edit_attempts": 2,
     "image_edit_drift_limit": 40.0,
+    "image_edit_min_change": 12.0,
     "session_hashes": {},
 }
 
