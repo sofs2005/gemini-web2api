@@ -316,7 +316,10 @@ def _build_headers(session_hash=None, request_uuid=None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        # urllib does not decode Content-Encoding; asking for br/zstd here makes
+        # Google answer with Brotli, which parses to zero candidates and surfaces
+        # as an empty assistant message with HTTP 200.
+        "Accept-Encoding": "identity",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
         "Cache-Control": "no-cache",
         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
@@ -965,6 +968,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         phase = "preflight"
         response_status = "unknown"
         response_bytes = 0
+        response_encoding = "identity"
         try:
             if cancelled and cancelled():
                 raise ConnectionAbortedError("Client disconnected before generation")
@@ -992,6 +996,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=timeout)
             response_status = getattr(resp, "status", getattr(resp, "code", "unknown"))
+            declared_encoding = resp.headers.get("Content-Encoding") if hasattr(resp, "headers") else None
+            response_encoding = (
+                declared_encoding.strip().lower()
+                if isinstance(declared_encoding, str) and declared_encoding.strip()
+                else "identity"
+            )
             phase = "read"
             try:
                 if deadline is None and on_first_response is None:
@@ -1023,6 +1033,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     raw = b"".join(parts).decode("utf-8", errors="replace")
             finally:
                 resp.close()
+            if response_encoding not in ("identity", ""):
+                raise GeminiUpstreamError(
+                    f"Upstream answered with Content-Encoding={response_encoding}; "
+                    "the buffered transport only reads identity bodies. "
+                    "Check the Accept-Encoding request header."
+                )
             phase = "parse"
             candidate_count, candidate_chars, longest_chars, tail_lengths, repeated_prefix = _response_candidate_stats(raw)
             text = extract_response_text(raw)
@@ -1030,6 +1046,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 f"upstream_finish transport=buffered id={trace_id} attempt={attempt + 1} "
                 f"duration_ms={int((time.monotonic() - attempt_started) * 1000)} "
                 f"http_status={response_status} response_bytes={response_bytes} "
+                f"content_encoding={response_encoding} "
                 f"frames={sum(1 for line in raw.split(chr(10)) if chr(34)+'wrb.fr'+chr(34) in line)} "
                 f"candidates={candidate_count} candidate_chars={candidate_chars} "
                 f"longest_chars={longest_chars} tail_lengths={tail_lengths} "

@@ -24,7 +24,7 @@ docker pull ghcr.io/sofs2005/gemini-web2api:latest
 - 流程：
   1. `git fetch upstream main`
   2. 上游无新提交 → 直接结束（不产生空提交）
-  3. 有新提交 → `git rebase upstream/main`，把本仓库唯一的 CI 提交接到上游最新提交之上（历史线性，无合并提交）；冲突则退回 `merge -X theirs`，以上游实现为准
+  3. 有新提交 → `git rebase upstream/main`，把本仓库的本地提交接到上游最新提交之上（历史线性，无合并提交）；**冲突则中止同步并报错，绝不丢弃本地修复**
   4. 跑 `pytest` 回归，失败则不同步
   5. `push --force-with-lease` 到 fork 的 `main`
   6. 显式 `gh workflow run docker.yml` 兜底，保证 `latest` 一定被重建
@@ -63,3 +63,11 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 自用脚本（上游抽离 panel4 时未收录），以及 54 个与上游内容重复的旧提交。
 已备份脚本到工作区 `work/gemini-web2api/panel4-backup/` 后把 `main` 重置为上游历史，
 之后的同步都是 fast-forward，不再产生合并提交。
+
+## 本地修复（fork 特有，不在上游）
+
+| 修复 | 文件 | 原因 |
+|------|------|------|
+| `Accept-Encoding: identity` + 压缩响应显式报错 | `gemini_web2api/gemini.py` | 2026-10-29 起 Google 对带 `br, zstd` 的请求返回 Brotli，urllib 无法解码，表现为 **HTTP 200 + 空消息**。`tests/test_upstream_encoding.py` 守住这条。 |
+
+同步时如与上游冲突，工作流会失败并保留本地修复——需要人工 rebase 后重跑。
