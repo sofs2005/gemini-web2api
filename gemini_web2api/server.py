@@ -1,4 +1,5 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+import base64
 import ipaddress
 import json
 import os
@@ -25,6 +26,7 @@ from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prom
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
 from .image_ops import (
     ImageOpsUnavailable, composite_crop_edit, mask_geometry, prepare_crop_edit,
+    thumbnail_drift,
 )
 from .cache import CACHE
 from .rotation import rotation_worker_alive
@@ -68,8 +70,11 @@ def _chat_image_prompt(request: dict):
     return None
 
 
-def _generated_image_payload(image, response_format: str, transform=None):
-    """Resolve an image, falling back to the preview URL if full-size delivery fails."""
+def _download_generated_image_bytes(image):
+    """Download a generated image, falling back to the preview URL.
+
+    Returns ``(image_bytes, mime, source_kind, source_url)``.
+    """
     full_size_url = get_full_size_image(image)
     candidates = []
     if full_size_url:
@@ -82,22 +87,27 @@ def _generated_image_payload(image, response_format: str, transform=None):
     last_error = None
     for index, (source_kind, source_url) in enumerate(candidates):
         try:
-            import base64
             image_bytes, mime = download_generated_image(source_url)
-            if transform is not None:
-                image_bytes, mime = transform(image_bytes, mime)
-            encoded = base64.b64encode(image_bytes).decode("ascii")
-            if response_format == "url":
-                data = {"url": "data:%s;base64,%s" % (mime, encoded)}
-            else:
-                data = {"b64_json": encoded}
-            return data, source_kind, source_url
+            return image_bytes, mime, source_kind, source_url
         except Exception as exc:
             last_error = exc
             if index + 1 < len(candidates):
                 log("image_generation_fallback from=%s to=%s error_type=%s" % (
                     source_kind, candidates[index + 1][0], type(exc).__name__))
     raise last_error
+
+
+def _generated_image_payload(image, response_format: str, transform=None):
+    """Resolve an image, falling back to the preview URL if full-size delivery fails."""
+    image_bytes, mime, source_kind, source_url = _download_generated_image_bytes(image)
+    if transform is not None:
+        image_bytes, mime = transform(image_bytes, mime)
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    if response_format == "url":
+        data = {"url": "data:%s;base64,%s" % (mime, encoded)}
+    else:
+        data = {"b64_json": encoded}
+    return data, source_kind, source_url
 
 
 def _generated_image_output(prompt: str, response_format: str):
@@ -311,57 +321,70 @@ def _multipart_file(fields: dict, name: str, required: bool = False):
     return data, mime, filename
 
 
-def _edit_prompt(prompt: str, has_mask: bool) -> str:
-    if not has_mask:
+def _selection_description(geometry) -> str:
+    """Describe the mask region in words the image model can act on."""
+    width, height = geometry.width, geometry.height
+    x0, y0, x1, y1 = geometry.bounds
+    percent_width = round(100 * (x1 - x0) / width)
+    percent_height = round(100 * (y1 - y0) / height)
+    center_x = (x0 + x1) / 2 / width
+    center_y = (y0 + y1) / 2 / height
+    horizontal = "left" if center_x < 0.34 else ("right" if center_x > 0.66 else "center")
+    vertical = "upper" if center_y < 0.34 else ("lower" if center_y > 0.66 else "middle")
+    return (
+        f"- It covers about {percent_width}% of the frame width and "
+        f"{percent_height}% of the frame height.\n"
+        f"- It sits in the {vertical} {horizontal} of the frame.\n"
+        "- It is a small local area inside a much larger scene."
+    )
+
+
+def _edit_prompt(prompt: str, geometry=None) -> str:
+    if geometry is None:
         return prompt
     return (
-        "You are performing a strict masked image edit. "
-        "This is a hard-stencil edit, not a style suggestion, and the mask is a "
-        "pixel-level lock.\n\n"
-        "Image 1 is the source image. Image 2 is the edit mask. "
-        "It is a location reference, not a style reference.\n\n"
-        "Mask semantics:\n"
-        "- The transparent region of the mask (alpha = 0) is the ONLY editable area.\n"
-        "- The opaque region of the mask (alpha = 255) must remain completely unchanged.\n"
-        "- Partially transparent edge pixels are only for a natural boundary blend.\n"
-        "- If your viewer renders transparency as black, white, or a checkerboard, "
-        "the region that differs from the opaque background is the editable area.\n\n"
-        "HARD RULES - all must be true:\n"
-        "1. The output must keep the exact dimensions, framing, camera angle, perspective, "
-        "crop, and composition of Image 1.\n"
-        "2. Outside the transparent region, the output must be a pixel-for-pixel copy of "
-        "Image 1. Do not redraw, relight, recolor, regrade, denoise, sharpen, blur, or "
-        "restyle any opaque pixel.\n"
-        "3. Do not regenerate, extend, or reimagine anything outside the transparent region: "
-        "not the background, scenery, sky, water, ground, buildings, props, horizon, "
-        "weather, or lighting.\n"
-        "4. The only visible difference between Image 1 and the output must be inside the "
-        "transparent region.\n"
-        "5. Put the requested subject entirely inside the transparent region. Its full "
-        "bounding box, including hair, hands, feet, board, spray, and shadow, must be inside. "
-        "No part may cross into the opaque region.\n"
-        "6. Do not move the subject to a more natural location. Do not choose a different "
-        "wave or another part of the image. The transparent region is the only allowed "
-        "location.\n"
-        "7. Do not place the requested subject outside the transparent region, even if it "
-        "looks more natural there.\n"
-        "8. The edit is mandatory. The transparent region must visibly change to satisfy "
-        "the user instruction. Returning that region unchanged is a failed answer. If the "
-        "subject is too large to fit, scale it down until all of it is inside; fitting "
-        "inside the region takes priority over realistic scale or natural placement.\n"
-        "9. Inside the transparent region, preserve the existing background as much as "
-        "possible. Match the surrounding water texture, foam, perspective, lighting, color, "
-        "and weather. Do not add a rectangular patch, border, frame, vignette, or visible "
-        "seam.\n"
-        "10. Do not add text, watermarks, logos, borders, or extra objects. Do not copy the "
-        "mask image's colors into the output.\n\n"
-        "Before you answer, verify:\n"
-        "- Does the transparent region now show the requested change? An unchanged "
-        "region is a failed edit.\n"
-        "- Is every changed pixel inside the transparent region?\n"
-        "- Is the opaque region unchanged?\n"
-        "- Is the requested subject fully inside the transparent region?\n"
-        "Revise the image until all answers are yes, then return the edited image.\n\n"
+        "You are editing one small selected area of Image 1.\n\n"
+        "Image 1 is the source image. Image 2 is a selection mask: the transparent "
+        "area marks the only pixels you may change. The mask is a location reference "
+        "only.\n\n"
+        "Where the selection is:\n"
+        + _selection_description(geometry)
+        + "\n\n"
+        "How to edit:\n"
+        "- Make the requested change inside the selected area only.\n"
+        "- Change only the pixels needed for that content. Leave the rest of the "
+        "selected area's original texture intact: existing grain, streaks, fog, spray, "
+        "color and lighting must continue unchanged inside the selection.\n"
+        "- The change must look like a local retouch of Image 1, not like a patch, "
+        "cut-out, sticker, or collage.\n"
+        "- The result must be seamless: at the selection boundary there must be no "
+        "visible edge, outline, halo, color step, brightness step, blur, or "
+        "lasso-shaped border.\n"
+        "- Do not invent an object whose outline follows the selection shape. Do not "
+        "fill the selection with a flat color, gradient, cloud blob, sky, fog, or "
+        "blurred texture.\n"
+        "- Never reproduce the mask image in the output. Its black or transparent "
+        "pixels must not appear as black, white, a hole, or a silhouette in your "
+        "result.\n"
+        "- Never treat Image 2 as a shape to draw or a layer to paste. It only tells "
+        "you where the edit may happen.\n\n"
+        "Hard constraints:\n"
+        "- Keep the exact framing, resolution, perspective, camera angle and crop of "
+        "Image 1.\n"
+        "- Every pixel outside the selected area must stay exactly as in Image 1: no "
+        "relighting, recoloring, regrading, denoising, sharpening, blurring, or "
+        "restyling.\n"
+        "- Do not add text, watermarks, logos, borders, frames, vignettes, or extra "
+        "objects.\n"
+        "- The requested change is required: an unchanged selected area is a failed "
+        "edit. If the requested content cannot fit at the size you want, make it "
+        "smaller so that it fits.\n\n"
+        "Before answering, verify:\n"
+        "- Did the selected area change as requested?\n"
+        "- Is the boundary invisible, with no visible lasso edge?\n"
+        "- Is the original texture inside the selection still recognizable?\n"
+        "- Is everything outside the selection identical to Image 1?\n"
+        "Revise until all answers are yes, then return the edited image.\n\n"
         "User instruction:\n"
         + prompt
     )
@@ -803,6 +826,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if ignored_fields:
             log("image_edit_compat ignored_fields=%s" % ",".join(ignored_fields))
+        drift_limit = None
         if crop_plan is not None:
             attachments = [
                 (crop_plan.crop_image, "image/png", "crop.png"),
@@ -823,11 +847,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             full_box = (0, 0, width, height)
             full_size = (width, height)
             attachments = [image, mask]
-            edit_prompt = _edit_prompt(prompt, True)
+            edit_prompt = _edit_prompt(prompt, mask_geometry_info)
             transform = lambda edited_bytes, edited_mime: composite_crop_edit(
                 image[0], image[1], edited_bytes, edited_mime,
                 mask[0], full_box, full_size,
             )
+            drift_limit = float(CONFIG.get("image_edit_drift_limit", 18.0))
             log("image_edit_mode=prompt_composite size=%s mask_pixels=%d" % (
                 full_size, mask_geometry_info.transparent_pixels,
             ))
@@ -835,18 +860,50 @@ class GeminiHandler(BaseHTTPRequestHandler):
             attachments = [image]
             edit_prompt = prompt
             transform = None
+        attempts = 1
+        if drift_limit is not None:
+            attempts = max(1, min(3, int(CONFIG.get("image_edit_attempts", 2))))
         try:
             file_refs = _upload_images(attachments)
-            result = generate_image_structured(edit_prompt, file_refs=file_refs)
-            if not result.images:
-                raise RuntimeError("Gemini returned no generated image metadata")
-            data, source_kind, source_url = _generated_image_payload(
-                result.images[0], response_format, transform=transform
-            )
+            best = None
+            for attempt in range(1, attempts + 1):
+                result = generate_image_structured(edit_prompt, file_refs=file_refs)
+                if not result.images:
+                    raise RuntimeError("Gemini returned no generated image metadata")
+                edited_bytes, edited_mime, source_kind, source_url = (
+                    _download_generated_image_bytes(result.images[0])
+                )
+                drift = None
+                if drift_limit is not None:
+                    try:
+                        drift = thumbnail_drift(
+                            image[0], image[1], edited_bytes, edited_mime, mask[0]
+                        )
+                    except ImageOpsUnavailable:
+                        drift = None
+                    except (RuntimeError, ValueError) as exc:
+                        log("image_edit_drift_unavailable error_type=%s" % type(exc).__name__)
+                if best is None or (drift is not None and (best[0] is None or drift < best[0])):
+                    best = (drift, edited_bytes, edited_mime, source_kind, source_url)
+                if drift is not None:
+                    log("image_edit_attempt attempt=%d/%d mask_drift=%.1f" % (
+                        attempt, attempts, drift))
+                if drift is None or drift <= drift_limit or attempt == attempts:
+                    break
+            drift, edited_bytes, edited_mime, source_kind, source_url = best
+            if transform is not None:
+                edited_bytes, edited_mime = transform(edited_bytes, edited_mime)
+            encoded = base64.b64encode(edited_bytes).decode("ascii")
+            if response_format == "url":
+                data = {"url": "data:%s;base64,%s" % (edited_mime, encoded)}
+            else:
+                data = {"b64_json": encoded}
             log(
-                "image_edit_result selected_full_size=%s response_format=%s source_host=%s source_path=%s"
+                "image_edit_result selected_full_size=%s response_format=%s "
+                "mask_drift=%s source_host=%s source_path=%s"
                 % (
                     source_kind == "full_size", response_format,
+                    "n/a" if drift is None else "%.1f" % drift,
                     (urlsplit(source_url).hostname or "-"),
                     (urlsplit(source_url).path or "/"),
                 )

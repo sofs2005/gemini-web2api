@@ -430,3 +430,60 @@ def composite_crop_edit(
         if not output_path.is_file():
             raise RuntimeError("ImageMagick did not create the composited image")
         return output_path.read_bytes(), output_mime
+
+
+# Gemini often regenerates or restyles the whole frame instead of editing the
+# requested area. That is invisible after the alpha composite, but the masked
+# region still carries the regenerated content, which is what causes the
+# "different background inside the patch" look. Comparing a small thumbnail of
+# the raw output against the source outside the mask gives a cheap drift score.
+_DRIFT_GRID = 128
+_DRIFT_TIMEOUT_SEC = 60
+
+
+def thumbnail_drift(source_bytes, source_mime, edited_bytes, edited_mime, mask_bytes,
+                    grid=_DRIFT_GRID):
+    """Mean per-channel difference outside the mask on a downscaled thumbnail.
+
+    Returns a 0-255 score. Values near 0 mean the model returned the original
+    pixels; large values mean it repainted the whole frame. Raises
+    ImageOpsUnavailable when ImageMagick is missing.
+    """
+    with tempfile.TemporaryDirectory(prefix="gemini-drift-") as temp_name:
+        temp_dir = Path(temp_name)
+        source_path = temp_dir / ("source" + _mime_suffix(source_mime))
+        edited_path = temp_dir / ("edited" + _mime_suffix(edited_mime))
+        mask_path = temp_dir / "mask.png"
+        source_path.write_bytes(source_bytes)
+        edited_path.write_bytes(edited_bytes)
+        mask_path.write_bytes(mask_bytes)
+
+        size = "%dx%d!" % (grid, grid)
+        source_rgb = _run_magick(
+            [source_path, "-resize", size, "-depth", "8", "rgb:-"], timeout=_DRIFT_TIMEOUT_SEC)
+        edited_rgb = _run_magick(
+            [edited_path, "-resize", size, "-depth", "8", "rgb:-"], timeout=_DRIFT_TIMEOUT_SEC)
+        mask_alpha = _run_magick(
+            [mask_path, "-alpha", "extract", "-filter", "point",
+             "-resize", size, "-depth", "8", "gray:-"], timeout=_DRIFT_TIMEOUT_SEC)
+
+    expected = grid * grid
+    if len(source_rgb) < expected * 3 or len(edited_rgb) < expected * 3:
+        raise RuntimeError("ImageMagick returned incomplete drift thumbnails")
+    if len(mask_alpha) < expected:
+        raise RuntimeError("ImageMagick returned an incomplete mask thumbnail")
+
+    total = 0
+    samples = 0
+    for index in range(expected):
+        # Only compare pixels the mask says must stay untouched.
+        if mask_alpha[index] < 250:
+            continue
+        offset = index * 3
+        total += (abs(source_rgb[offset] - edited_rgb[offset])
+                  + abs(source_rgb[offset + 1] - edited_rgb[offset + 1])
+                  + abs(source_rgb[offset + 2] - edited_rgb[offset + 2]))
+        samples += 1
+    if samples < 64:
+        return 0.0
+    return total / (samples * 3)

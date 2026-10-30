@@ -826,6 +826,8 @@ class StreamingEndpointTests(unittest.TestCase):
             "gemini_web2api.server.download_generated_image",
             return_value=(edited, "image/png"),
         ), mock.patch(
+            "gemini_web2api.server.thumbnail_drift", return_value=3.0,
+        ) as thumbnail_drift, mock.patch(
             "gemini_web2api.server.composite_crop_edit",
             return_value=(composited, "image/png"),
         ) as composite_crop_edit:
@@ -855,43 +857,143 @@ class StreamingEndpointTests(unittest.TestCase):
         generate_image_structured.assert_called_once()
         prompt = generate_image_structured.call_args.args[0]
         self.assertIn("replace the sky with a sunset", prompt)
-        self.assertIn("edit mask", prompt)
-        self.assertIn("strict masked image edit", prompt)
-        self.assertIn("ONLY editable area", prompt)
-        self.assertIn("must remain completely unchanged", prompt)
-        self.assertIn("not a style reference", prompt)
-        self.assertIn("entirely inside the transparent region", prompt)
+        self.assertIn("selection mask", prompt)
+        self.assertIn("local retouch", prompt)
+        self.assertIn("Do not fill the selection with a flat color", prompt)
+        self.assertIn("Never reproduce the mask image", prompt)
+        self.assertIn("failed edit", prompt)
+        self.assertIn("50% of the frame width", prompt)
+        self.assertIn("upper left of the frame", prompt)
         self.assertTrue(prompt.rstrip().endswith("replace the sky with a sunset"))
         self.assertEqual(
             generate_image_structured.call_args.kwargs["file_refs"],
             [("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")],
+        )
+        thumbnail_drift.assert_called_once_with(
+            source, "image/png", edited, "image/png", mask
         )
         composite_crop_edit.assert_called_once_with(
             source, "image/png", edited, "image/png", mask,
             (0, 0, 2, 2), (2, 2),
         )
 
+    def test_image_edit_retries_when_mask_drift_is_high(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2, alpha=True)
+        mask = _mask_png(2, 2, (0, 0, 1, 1))
+        drifted = b"\x89PNG\r\n\x1a\ndrifted"
+        clean = b"\x89PNG\r\n\x1a\nclean"
+        composited = b"\x89PNG\r\n\x1a\ncomposited"
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_attempts": 2,
+            "image_edit_drift_limit": 18.0,
+        }), mock.patch(
+            "gemini_web2api.server.upload_image",
+            side_effect=["/uploaded/source", "/uploaded/mask"],
+        ), mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            side_effect=[(drifted, "image/png"), (clean, "image/png")],
+        ), mock.patch(
+            "gemini_web2api.server.thumbnail_drift", side_effect=[40.0, 4.0],
+        ), mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(composited, "image/png"),
+        ) as composite_crop_edit:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            base64.b64decode(json.loads(body)["data"][0]["b64_json"]),
+            composited,
+        )
+        self.assertEqual(generate_image_structured.call_count, 2)
+        composite_crop_edit.assert_called_once_with(
+            source, "image/png", clean, "image/png", mask,
+            (0, 0, 2, 2), (2, 2),
+        )
+
+    def test_image_edit_keeps_least_drifted_attempt(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2, alpha=True)
+        mask = _mask_png(2, 2, (0, 0, 1, 1))
+        first = b"\x89PNG\r\n\x1a\nfirst"
+        second = b"\x89PNG\r\n\x1a\nsecond"
+        composited = b"\x89PNG\r\n\x1a\ncomposited"
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_attempts": 2,
+            "image_edit_drift_limit": 18.0,
+        }), mock.patch(
+            "gemini_web2api.server.upload_image",
+            side_effect=["/uploaded/source", "/uploaded/mask"],
+        ), mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ), mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            side_effect=[(first, "image/png"), (second, "image/png")],
+        ), mock.patch(
+            "gemini_web2api.server.thumbnail_drift", side_effect=[30.0, 45.0],
+        ), mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(composited, "image/png"),
+        ) as composite_crop_edit:
+            status, _, _body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        composite_crop_edit.assert_called_once_with(
+            source, "image/png", first, "image/png", mask,
+            (0, 0, 2, 2), (2, 2),
+        )
+
     def test_edit_prompt_is_strict_and_preserves_user_instruction(self):
-        prompt = _edit_prompt("add a surfer", True)
-        self.assertTrue(prompt.startswith("You are performing a strict masked image edit."))
-        self.assertIn(
-            "The transparent region of the mask (alpha = 0) is the ONLY editable area.",
-            prompt,
+        from types import SimpleNamespace
+
+        geometry = SimpleNamespace(
+            width=2816, height=1536, bounds=(2425, 142, 2779, 512),
+            transparent_pixels=76715, total_pixels=2816 * 1536,
         )
-        self.assertIn(
-            "The opaque region of the mask (alpha = 255) must remain completely unchanged.",
-            prompt,
-        )
-        self.assertIn("not a style reference", prompt)
-        self.assertIn("entirely inside the transparent region", prompt)
-        self.assertIn("hard-stencil", prompt)
-        self.assertIn("pixel-for-pixel copy", prompt)
-        self.assertIn("Revise the image until all answers are yes", prompt)
-        self.assertIn("The edit is mandatory", prompt)
-        self.assertIn("unchanged region is a failed edit", prompt)
-        self.assertIn("Do not place the requested subject outside", prompt)
-        self.assertTrue(prompt.endswith("User instruction:\nadd a surfer"))
-        self.assertEqual(_edit_prompt("add a surfer", False), "add a surfer")
+        prompt = _edit_prompt("add a surfer", geometry)
+        self.assertTrue(prompt.startswith("You are editing one small selected area"))
+        self.assertIn("It covers about 13% of the frame width", prompt)
+        self.assertIn("24% of the frame height", prompt)
+        self.assertIn("upper right of the frame", prompt)
+        self.assertIn("selection mask", prompt)
+        self.assertIn("local retouch", prompt)
+        self.assertIn("Do not fill the selection with a flat color", prompt)
+        self.assertIn("Never reproduce the mask image in the output", prompt)
+        self.assertIn("failed edit", prompt)
+        self.assertIn("no visible lasso edge", prompt)
+        self.assertTrue(prompt.rstrip().endswith("User instruction:\nadd a surfer"))
+        self.assertEqual(_edit_prompt("add a surfer"), "add a surfer")
 
     def test_crop_edit_prompt_is_crop_aware_and_preserves_user_instruction(self):
         prompt = _crop_edit_prompt("add a surfer", (528, 226))
