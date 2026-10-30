@@ -53,17 +53,15 @@ jobs:
           echo "即将合入的上游提交："
           git log --oneline --no-decorate HEAD..upstream/main
 
-          # 本地只有 .github/ 下的 CI 文件，rebase 到上游可保持线性历史（不产生合并提交）
+          # 本地只有 .github/ 与少量上游修复（见 README 下方的 fork 说明），rebase 到上游保持线性历史
           if git rebase upstream/main; then
             echo "rebase 成功"
           else
-            echo "::warning::rebase 存在冲突，改用 merge -X theirs 以上游实现为准重试"
             git rebase --abort || true
-            if ! git merge --no-edit -X theirs upstream/main; then
-              git merge --abort || true
-              echo "::error::自动同步失败，需要人工处理冲突"
-              exit 1
-            fi
+            echo "待合入的上游提交："
+            git log --oneline --no-decorate HEAD..upstream/main | head -20
+            echo "::error::rebase 冲突，已保留本地修复并中止同步，请人工处理"
+            exit 1
           fi
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
