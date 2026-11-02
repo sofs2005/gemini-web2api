@@ -963,6 +963,58 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertIn("selection mask", legacy)
         self.assertNotIn("Image 3", legacy)
 
+    def test_frame_matches_rejects_reframed_output(self):
+        from gemini_web2api.server import _frame_matches
+
+        self.assertTrue(_frame_matches((1600, 800), (2000, 1000), 0.02))
+        self.assertTrue(_frame_matches((1, 1), (2, 2), 0.02))
+        self.assertFalse(_frame_matches((1024, 1024), (1600, 900), 0.02))
+        self.assertFalse(_frame_matches((0, 0), (1600, 900), 0.02))
+
+    def test_image_edit_discards_reframed_generation(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(8, 4, alpha=True)
+        mask = _mask_png(8, 4, (0, 0, 4, 4))
+        square = b"\x89PNG\r\n\x1a\nsquare"
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_locator": False,
+            "image_edit_attempts": 2, "image_edit_frame_gate": True,
+        }), mock.patch(
+            "gemini_web2api.server.upload_image",
+            side_effect=["/uploaded/source", "/uploaded/mask"],
+        ), mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ), mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(square, "image/png"),
+        ), mock.patch(
+            "gemini_web2api.server.image_dimensions", return_value=(1024, 1024),
+        ), mock.patch(
+            "gemini_web2api.server.thumbnail_mask_stats", return_value=(3.0, 30.0),
+        ), mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(square, "image/png"),
+        ) as composite_crop_edit:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 502)
+        self.assertIn("reframed", json.loads(body)["error"]["message"])
+        composite_crop_edit.assert_not_called()
+
     def test_image_edit_retries_when_mask_drift_is_high(self):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
 

@@ -441,6 +441,18 @@ _DRIFT_GRID = 128
 _DRIFT_TIMEOUT_SEC = 60
 
 
+def image_dimensions(image_bytes: bytes, image_mime: str) -> tuple:
+    """Return the pixel size of an encoded image without decoding it in Python."""
+    with tempfile.TemporaryDirectory(prefix="gemini-size-") as temp_name:
+        path = Path(temp_name) / ("image" + _mime_suffix(image_mime))
+        path.write_bytes(image_bytes)
+        raw = _run_magick([path, "-format", "%w %h", "info:"], timeout=_MAGICK_TIMEOUT_SEC)
+    parts = raw.decode("ascii", "replace").split()
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        raise RuntimeError("could not read image dimensions")
+    return int(parts[0]), int(parts[1])
+
+
 def thumbnail_mask_stats(source_bytes, source_mime, edited_bytes, edited_mime, mask_bytes,
                          grid=_DRIFT_GRID):
     """Compare a thumbnail of the raw model output against the source.

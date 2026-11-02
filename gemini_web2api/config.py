@@ -43,10 +43,12 @@ DEFAULT_CONFIG = {
     "generated_image_max_bytes": 10 * 1024 * 1024,
     "generated_image_max_redirects": 3,
     "image_edit_crop": False,
-    "image_edit_locator": True,
+    "image_edit_locator": False,
     "image_edit_attempts": 3,
     "image_edit_drift_limit": 40.0,
     "image_edit_min_change": 8.0,
+    "image_edit_frame_gate": True,
+    "image_edit_frame_tolerance": 0.02,
     "session_hashes": {},
 }
 

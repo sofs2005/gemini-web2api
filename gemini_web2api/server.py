@@ -25,8 +25,8 @@ from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_too
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
 from .image_ops import (
-    ImageOpsUnavailable, build_marker_locator, composite_crop_edit, mask_geometry,
-    prepare_crop_edit, strip_edit_marker, thumbnail_mask_stats,
+    ImageOpsUnavailable, build_marker_locator, composite_crop_edit, image_dimensions,
+    mask_geometry, prepare_crop_edit, strip_edit_marker, thumbnail_mask_stats,
 )
 from .cache import CACHE
 from .rotation import rotation_worker_alive
@@ -107,6 +107,21 @@ def _edit_attempt_rank(drift: float, change: float, drift_limit: float, min_chan
     if drift <= drift_limit and change >= min_change:
         return (0, drift)
     return (1, -change)
+
+
+def _frame_matches(size: tuple, expected: tuple, tolerance: float) -> bool:
+    """True when a returned image keeps the source aspect ratio.
+
+    A reframed or square generation cannot be composited back through the mask
+    without cropping real content, so those attempts are discarded instead of
+    being resized to fit.
+    """
+    width, height = size
+    expected_width, expected_height = expected
+    if min(width, height, expected_width, expected_height) <= 0:
+        return False
+    ratio = (width / height) / (expected_width / expected_height)
+    return abs(ratio - 1.0) <= tolerance
 
 
 def _generated_image_payload(image, response_format: str, transform=None):
@@ -858,7 +873,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             log("image_edit_compat ignored_fields=%s" % ",".join(ignored_fields))
         drift_limit = None
         min_change = 0.0
+        frame_expected = None
         if crop_plan is not None:
+            frame_expected = crop_plan.crop_size
             attachments = [
                 (crop_plan.crop_image, "image/png", "crop.png"),
                 (crop_plan.crop_mask, "image/png", "mask.png"),
@@ -916,6 +933,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 image[0], image[1], edited_bytes, edited_mime,
                 mask[0], full_box, full_size,
             )
+            frame_expected = full_size
             drift_limit = float(CONFIG.get("image_edit_drift_limit", 40.0))
             min_change = float(CONFIG.get("image_edit_min_change", 8.0))
         else:
@@ -931,6 +949,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             best = None
             best_rank = None
             drift = change = None
+            rejected_frames = 0
+            rejected_size = None
             for attempt in range(1, attempts + 1):
                 attempt_prompt = edit_prompt
                 if attempt > 1:
@@ -946,6 +966,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 edited_bytes, edited_mime, source_kind, source_url = (
                     _download_generated_image_bytes(result.images[0])
                 )
+                if frame_expected is not None and CONFIG.get("image_edit_frame_gate", True):
+                    # Gemini sometimes re-frames the scene. Fitting that back into
+                    # the source box would crop real content, so refuse it.
+                    try:
+                        actual_size = image_dimensions(edited_bytes, edited_mime)
+                    except (ImageOpsUnavailable, RuntimeError) as exc:
+                        actual_size = None
+                        log("image_edit_frame_check_failed error_type=%s" % type(exc).__name__)
+                    if actual_size is not None and not _frame_matches(
+                        actual_size, frame_expected,
+                        float(CONFIG.get("image_edit_frame_tolerance", 0.02)),
+                    ):
+                        rejected_frames += 1
+                        rejected_size = actual_size
+                        log("image_edit_attempt attempt=%d/%d rejected=framing "
+                            "size=%dx%d expected=%dx%d" % (
+                                attempt, attempts, actual_size[0], actual_size[1],
+                                frame_expected[0], frame_expected[1]))
+                        continue
                 if strip_marker is not None:
                     try:
                         edited_bytes, edited_mime = strip_marker(edited_bytes, edited_mime)
@@ -981,6 +1020,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if attempt == attempts:
                     break
             if best is None:
+                if rejected_frames and rejected_size and frame_expected:
+                    raise RuntimeError(
+                        "Gemini reframed the photo (%dx%d instead of %dx%d); the edit "
+                        "was discarded instead of returning a cropped image"
+                        % (rejected_size + tuple(frame_expected)))
                 raise RuntimeError("Gemini returned no generated image metadata")
             drift, change, edited_bytes, edited_mime, source_kind, source_url = best
             if transform is not None:
