@@ -1,7 +1,17 @@
 # CI / 上游同步说明
 
 本仓库是 [meatRoll/gemini-web2api](https://github.com/meatRoll/gemini-web2api) 的 fork。
-`main` 的历史与上游完全一致（fast-forward 跟踪），本仓库只额外提交 `.github/` 下的 CI 文件。
+`main` 以上游为基底、用 rebase 保持线性历史，本地提交永远接在上游最新提交之上。
+
+本地提交**不止 `.github/` 下的 CI 文件**，还有两处改动上游代码的修复，见文末「本地修复」表：
+
+| 文件 | 说明 |
+|------|------|
+| `.github/workflows/docker.yml` | 镜像构建 + 推送 |
+| `.github/workflows/sync-upstream.yml` | 每日同步上游 |
+| `.github/SYNC.md` | 本文件 |
+| `gemini_web2api/gemini.py` | Brotli 空响应修复（上游未合，PR #2 仍 open） |
+| `tests/test_upstream_encoding.py` | 上述修复的回归测试 |
 
 ## 1. `docker.yml` — 编译并推送 Docker 镜像
 
@@ -53,9 +63,17 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 
 ## 冲突处理策略
 
-`main` 只跟踪上游，唯一本地改动是 `.github/workflows/sync-upstream.yml` 和本文件。
-自动合并冲突时选择“以上游为准”（`-X theirs`）不会丢任何东西。
-如需在 fork 里长期改上游文件，请把改动拆到独立文件，避免每日同步冲突。
+**本地提交里有真正改上游代码的修复（`gemini.py`），所以冲突必须人工处理。**
+
+- ⚠️ **禁止**用「以上游为准」（`-X theirs` / `checkout --theirs`）解冲突——那会把 Brotli
+  修复冲掉，服务退回 **HTTP 200 + 空消息** 的静默失败，而且日志里看不出来。
+- `sync-upstream.yml` 的策略是：rebase 冲突 → 工作流失败、不 push，本地修复完好保留。
+  处理方式：本地 `git fetch upstream && git rebase upstream/main`，手工解冲突，跑
+  `pytest tests/test_upstream_encoding.py`，再 `push --force-with-lease`，最后手动
+  `gh workflow run docker.yml`。
+- 判断冲突是否危险：只要 `gemini_web2api/gemini.py` 的 `_build_headers()`（`Accept-Encoding`）
+  或 `generate()` 里的 `Content-Encoding` 检查被改动，就必须确认修复还在。
+- 新写的本地改动尽量拆到独立文件（如 `.github/`、新模块），减少与上游争同一段代码。
 
 ## 历史说明
 
