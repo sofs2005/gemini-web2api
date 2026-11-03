@@ -1018,7 +1018,7 @@ class StreamingEndpointTests(unittest.TestCase):
             return_value=(edited, "image/png"),
         ), mock.patch(
             "gemini_web2api.server.thumbnail_mask_stats", return_value=(3.0, 30.0),
-        ), mock.patch(
+        ) as thumbnail_mask_stats, mock.patch(
             "gemini_web2api.server.composite_crop_edit",
             return_value=(composited, "image/png"),
         ) as composite_crop_edit:
@@ -1042,6 +1042,8 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertIn("add gulls", prompt)
         self.assertIn("Edit this photo directly", prompt)
         self.assertNotIn("mask", prompt.lower())
+        thumbnail_mask_stats.assert_called_once_with(
+            b"context-crop", "image/png", edited, "image/png", b"context-mask")
         composite_crop_edit.assert_called_once_with(
             source, "image/png", edited, "image/png", b"context-mask",
             (0, 0, 2, 2), (2, 2),

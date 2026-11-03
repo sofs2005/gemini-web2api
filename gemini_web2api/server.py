@@ -924,6 +924,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         drift_limit = None
         min_change = 0.0
         frame_expected = None
+        stats_ref = None
         if context_plan is not None:
             frame_expected = context_plan.crop_size
             # No mask and no marker: the model gets a normal photo crop with real
@@ -935,13 +936,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 context_plan.crop_size,
             )
             strip_marker = None
+            stats_ref = (context_plan.crop_image, "image/png", context_plan.crop_mask)
+            drift_limit = float(CONFIG.get("image_edit_drift_limit", 40.0))
+            min_change = float(CONFIG.get("image_edit_min_change", 8.0))
 
             def transform(edited_bytes, edited_mime):
                 if CONFIG.get("image_edit_tone_match", True):
                     try:
                         edited_bytes, edited_mime = match_crop_tone(
                             edited_bytes, edited_mime, image[0], image[1],
-                            context_plan.crop_box,
+                            context_plan.crop_box, context_plan.crop_mask,
                         )
                     except (ImageOpsUnavailable, RuntimeError, ValueError) as exc:
                         log("image_edit_tone_match_failed error_type=%s"
@@ -1016,6 +1020,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 mask[0], full_box, full_size,
             )
             frame_expected = full_size
+            stats_ref = (image[0], image[1], mask[0])
             drift_limit = float(CONFIG.get("image_edit_drift_limit", 40.0))
             min_change = float(CONFIG.get("image_edit_min_change", 8.0))
         else:
@@ -1078,7 +1083,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if drift_limit is not None:
                     try:
                         stats = thumbnail_mask_stats(
-                            image[0], image[1], edited_bytes, edited_mime, mask[0]
+                            stats_ref[0], stats_ref[1], edited_bytes, edited_mime,
+                            stats_ref[2],
                         )
                     except ImageOpsUnavailable:
                         stats = None

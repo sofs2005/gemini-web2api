@@ -370,13 +370,17 @@ def _crop_two(tmp_dir: Path, edited_bytes: bytes, edited_mime: str,
 
 
 def match_crop_tone(edited_bytes: bytes, edited_mime: str, source_bytes: bytes,
-                    source_mime: str, crop_box: tuple) -> tuple:
-    """Match the edited crop's mean and spread to the original crop.
+                    source_mime: str, crop_box: tuple, crop_mask_bytes: bytes) -> tuple:
+    """Match the edited crop's background tone to the original crop.
 
     A crop regenerated at a small size often comes back with a different
     exposure or white balance. Aligning per-channel mean and standard deviation
-    keeps the retouch from reading as a pasted rectangle. Returns the edited
-    bytes unchanged when ImageMagick cannot compute the statistics.
+    keeps the retouch from reading as a pasted rectangle.
+
+    The statistics are measured with the editable area painted back from the
+    source, so newly added content (a bright bird, a dark cloud) cannot skew the
+    correction and leave a visible patch. Returns the edited bytes unchanged
+    when ImageMagick cannot compute the statistics.
     """
     output_mime = "image/jpeg" if edited_mime == "image/jpeg" else "image/png"
     with tempfile.TemporaryDirectory(prefix="gemini-tone-") as temp_name:
@@ -391,12 +395,26 @@ def match_crop_tone(edited_bytes: bytes, edited_mime: str, source_bytes: bytes,
             "-extent", "%dx%d" % (width, height),
             fitted_path,
         ])
+        # Replace the edited area with the original pixels before measuring.
+        mask_path = temp_dir / "tone-mask.png"
+        mask_path.write_bytes(crop_mask_bytes)
+        editable_alpha = temp_dir / "tone-editable.png"
+        _run_magick([mask_path, "-alpha", "extract", "-negate", editable_alpha])
+        source_patch = temp_dir / "tone-source-patch.png"
+        _run_magick([
+            crop_path, editable_alpha, "-alpha", "off",
+            "-compose", "CopyOpacity", "-composite", source_patch,
+        ])
+        background_path = temp_dir / "tone-background.png"
+        _run_magick([
+            fitted_path, source_patch, "-compose", "Over", "-composite", background_path,
+        ])
         keys = ("mean.r", "mean.g", "mean.b",
                 "standard_deviation.r", "standard_deviation.g", "standard_deviation.b")
         fmt = " ".join("%%[fx:%s]" % key for key in keys)
         try:
             edited_stats = [float(v) for v in _run_magick(
-                [fitted_path, "-format", fmt, "info:"]).decode().split()]
+                [background_path, "-format", fmt, "info:"]).decode().split()]
             source_stats = [float(v) for v in _run_magick(
                 [crop_path, "-format", fmt, "info:"]).decode().split()]
         except (RuntimeError, ValueError):
