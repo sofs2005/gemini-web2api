@@ -26,7 +26,8 @@ from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prom
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
 from .image_ops import (
     ImageOpsUnavailable, build_marker_locator, composite_crop_edit, image_dimensions,
-    mask_geometry, prepare_crop_edit, strip_edit_marker, thumbnail_mask_stats,
+    mask_geometry, match_crop_tone, prepare_context_crop, prepare_crop_edit,
+    strip_edit_marker, thumbnail_mask_stats,
 )
 from .cache import CACHE
 from .rotation import rotation_worker_alive
@@ -432,6 +433,39 @@ def _edit_prompt(prompt: str, geometry=None, locator: bool = False) -> str:
         "Revise until all answers are yes, then return the edited image.\n\n"
         "User instruction:\n"
         + prompt
+    )
+
+
+def _context_edit_prompt(prompt: str, geometry, crop_box: tuple, crop_size: tuple) -> str:
+    """Prompt for a context crop that is sent without any mask attachment."""
+    crop_width, crop_height = crop_size
+    x0, y0, _, _ = crop_box
+    mask_x0, mask_y0, mask_x1, mask_y1 = geometry.bounds
+    center_x = (mask_x0 + mask_x1) / 2 - x0
+    center_y = (mask_y0 + mask_y1) / 2 - y0
+    horizontal = "left" if center_x < crop_width / 3 else (
+        "right" if center_x > 2 * crop_width / 3 else "center")
+    vertical = "upper" if center_y < crop_height / 3 else (
+        "lower" if center_y > 2 * crop_height / 3 else "middle")
+    percent_width = round(100 * (mask_x1 - mask_x0) / crop_width)
+    percent_height = round(100 * (mask_y1 - mask_y0) / crop_height)
+    return (
+        "This is a photograph. Edit this photo directly.\n\n"
+        "Where the change belongs:\n"
+        f"- It sits in the {vertical} {horizontal} of the frame.\n"
+        f"- It covers roughly {percent_width}% of the frame width and "
+        f"{percent_height}% of the frame height.\n\n"
+        "What to do:\n"
+        f"- {prompt}\n"
+        "- Change only that part of the photo and nothing else.\n"
+        "- Keep the same framing, resolution, perspective, camera angle and crop.\n"
+        "- Keep the surrounding photo's rain, grain, spray, fog, color and lighting "
+        "continuous through the change.\n"
+        "- Blend the new content into its surroundings: no visible edge, seam, "
+        "patch, sticker, halo, brightness step or shape outline.\n"
+        "- Do not fill the area with a flat color, gradient, blurred texture, or "
+        "an object whose outline follows a selection.\n"
+        "- The edit is required: an unchanged photo is a failed edit.\n"
     )
 
 
@@ -847,9 +881,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         crop_plan = None
+        context_plan = None
         mask_geometry_info = None
         if mask is not None:
-            if CONFIG.get("image_edit_crop", False):
+            if CONFIG.get("image_edit_context_crop", True):
+                try:
+                    context_plan = prepare_context_crop(image[0], mask[0], image[1])
+                except ImageOpsUnavailable:
+                    log("image_edit_context_crop_fallback reason=imagemagick_unavailable")
+                except ValueError as exc:
+                    self.send_json({"error": {"message": str(exc)}}, 400)
+                    return
+                except RuntimeError as exc:
+                    self.send_json({
+                        "error": {"message": "image edit preparation failed: "
+                                             + safe_error_message(exc, 500)}}, 502)
+                    return
+                if context_plan is not None:
+                    mask_geometry_info = context_plan.geometry
+            if context_plan is None and CONFIG.get("image_edit_crop", False):
                 try:
                     crop_plan = prepare_crop_edit(image[0], mask[0], image[1])
                 except ImageOpsUnavailable:
@@ -874,7 +924,39 @@ class GeminiHandler(BaseHTTPRequestHandler):
         drift_limit = None
         min_change = 0.0
         frame_expected = None
-        if crop_plan is not None:
+        if context_plan is not None:
+            frame_expected = context_plan.crop_size
+            # No mask and no marker: the model gets a normal photo crop with real
+            # surroundings, which is the only setup where it edits instead of
+            # filling the marked shape.
+            attachments = [(context_plan.crop_image, "image/png", "crop.png")]
+            edit_prompt = _context_edit_prompt(
+                prompt, context_plan.geometry, context_plan.crop_box,
+                context_plan.crop_size,
+            )
+            strip_marker = None
+
+            def transform(edited_bytes, edited_mime):
+                if CONFIG.get("image_edit_tone_match", True):
+                    try:
+                        edited_bytes, edited_mime = match_crop_tone(
+                            edited_bytes, edited_mime, image[0], image[1],
+                            context_plan.crop_box,
+                        )
+                    except (ImageOpsUnavailable, RuntimeError, ValueError) as exc:
+                        log("image_edit_tone_match_failed error_type=%s"
+                            % type(exc).__name__)
+                return composite_crop_edit(
+                    image[0], image[1], edited_bytes, edited_mime,
+                    context_plan.crop_mask, context_plan.crop_box,
+                    context_plan.crop_size,
+                )
+
+            log("image_edit_mode=context_crop box=%s size=%s mask_pixels=%d" % (
+                context_plan.crop_box, context_plan.crop_size,
+                context_plan.geometry.transparent_pixels,
+            ))
+        elif crop_plan is not None:
             frame_expected = crop_plan.crop_size
             attachments = [
                 (crop_plan.crop_image, "image/png", "crop.png"),

@@ -814,7 +814,8 @@ class StreamingEndpointTests(unittest.TestCase):
         mask = _mask_png(2, 2, (0, 0, 1, 1))
         edited = b"\x89PNG\r\n\x1a\n"
         composited = b"\x89PNG\r\n\x1a\ncomposited"
-        with mock.patch.dict(CONFIG, {"image_edit_crop": False, "image_edit_locator": False}), mock.patch(
+        with mock.patch.dict(CONFIG, {"image_edit_crop": False, "image_edit_locator": False,
+                                 "image_edit_context_crop": False}), mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
         ) as upload_image, mock.patch(
@@ -894,6 +895,7 @@ class StreamingEndpointTests(unittest.TestCase):
         composited = b"\x89PNG\r\n\x1a\ncomposited"
         with mock.patch.dict(CONFIG, {
             "image_edit_crop": False, "image_edit_locator": True,
+            "image_edit_context_crop": False,
         }), mock.patch(
             "gemini_web2api.server.build_marker_locator", return_value=plan
         ) as build_marker_locator, mock.patch(
@@ -963,6 +965,88 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertIn("selection mask", legacy)
         self.assertNotIn("Image 3", legacy)
 
+    def test_context_crop_box_keeps_context_around_selection(self):
+        from gemini_web2api.image_ops import context_crop_box
+
+        # Selection sits at the top edge, so the box can only grow downward.
+        box = context_crop_box((2425, 141, 2780, 513), 2816, 1536, 0.8)
+        x0, y0, x1, y1 = box
+        self.assertLessEqual(x0, 2425 - 100)
+        self.assertLessEqual(y0, 141)
+        self.assertGreaterEqual(x1, 2816)
+        self.assertGreaterEqual(y1, 513 + 200)
+        self.assertGreaterEqual(x1, x0)
+        self.assertLessEqual(x1, 2816)
+        self.assertLessEqual(y1, 1536)
+        # The short side must be filled with more than just the mask.
+        self.assertGreater((x1 - x0) * (y1 - y0), 400 * 400)
+
+    def test_image_edit_endpoint_uses_context_crop_without_mask(self):
+        from types import SimpleNamespace
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2, alpha=True)
+        mask = _mask_png(2, 2, (0, 0, 1, 1))
+        plan = SimpleNamespace(
+            crop_image=b"context-crop",
+            crop_mask=b"context-mask",
+            crop_box=(0, 0, 2, 2),
+            crop_size=(2, 2),
+            geometry=SimpleNamespace(transparent_pixels=1, bounds=(0, 0, 1, 1),
+                                     width=2, height=2),
+        )
+        edited = b"\x89PNG\r\n\x1a\nedited"
+        composited = b"\x89PNG\r\n\x1a\ncomposited"
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_locator": False,
+            "image_edit_context_crop": True, "image_edit_attempts": 1,
+            "image_edit_tone_match": False,
+        }), mock.patch(
+            "gemini_web2api.server.prepare_context_crop", return_value=plan
+        ) as prepare_context_crop, mock.patch(
+            "gemini_web2api.server.upload_image", return_value="/uploaded/crop",
+        ) as upload_image, mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(edited, "image/png"),
+        ), mock.patch(
+            "gemini_web2api.server.thumbnail_mask_stats", return_value=(3.0, 30.0),
+        ), mock.patch(
+            "gemini_web2api.server.composite_crop_edit",
+            return_value=(composited, "image/png"),
+        ) as composite_crop_edit:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "add gulls", "response_format": "b64_json"},
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            base64.b64decode(json.loads(body)["data"][0]["b64_json"]), composited)
+        prepare_context_crop.assert_called_once_with(source, mask, "image/png")
+        self.assertEqual(upload_image.call_args_list, [
+            mock.call(b"context-crop", "crop.png", "image/png"),
+        ])
+        prompt = generate_image_structured.call_args.args[0]
+        self.assertIn("add gulls", prompt)
+        self.assertIn("Edit this photo directly", prompt)
+        self.assertNotIn("mask", prompt.lower())
+        composite_crop_edit.assert_called_once_with(
+            source, "image/png", edited, "image/png", b"context-mask",
+            (0, 0, 2, 2), (2, 2),
+        )
+
     def test_frame_matches_rejects_reframed_output(self):
         from gemini_web2api.server import _frame_matches
 
@@ -982,6 +1066,7 @@ class StreamingEndpointTests(unittest.TestCase):
         square = b"\x89PNG\r\n\x1a\nsquare"
         with mock.patch.dict(CONFIG, {
             "image_edit_crop": False, "image_edit_locator": False,
+            "image_edit_context_crop": False,
             "image_edit_attempts": 2, "image_edit_frame_gate": True,
         }), mock.patch(
             "gemini_web2api.server.upload_image",
@@ -1027,8 +1112,8 @@ class StreamingEndpointTests(unittest.TestCase):
         clean = b"\x89PNG\r\n\x1a\nclean"
         composited = b"\x89PNG\r\n\x1a\ncomposited"
         with mock.patch.dict(CONFIG, {
-            "image_edit_crop": False, "image_edit_attempts": 2,
-            "image_edit_drift_limit": 18.0,
+            "image_edit_crop": False, "image_edit_context_crop": False,
+            "image_edit_attempts": 2, "image_edit_drift_limit": 18.0,
         }), mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
@@ -1082,8 +1167,8 @@ class StreamingEndpointTests(unittest.TestCase):
         second = b"\x89PNG\r\n\x1a\nsecond"
         composited = b"\x89PNG\r\n\x1a\ncomposited"
         with mock.patch.dict(CONFIG, {
-            "image_edit_crop": False, "image_edit_attempts": 2,
-            "image_edit_drift_limit": 18.0,
+            "image_edit_crop": False, "image_edit_context_crop": False,
+            "image_edit_attempts": 2, "image_edit_drift_limit": 18.0,
         }), mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
@@ -1175,7 +1260,9 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         edited = b"\x89PNG\r\n\x1a\nedited"
         composited = b"\x89PNG\r\n\x1a\ncomposited"
-        with mock.patch.dict(CONFIG, {"image_edit_crop": True}), mock.patch(
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": True, "image_edit_context_crop": False,
+        }), mock.patch(
             "gemini_web2api.server.prepare_crop_edit", return_value=plan
         ), mock.patch(
             "gemini_web2api.server.upload_image",

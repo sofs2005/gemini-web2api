@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
     "image_edit_min_change": 8.0,
     "image_edit_frame_gate": True,
     "image_edit_frame_tolerance": 0.02,
+    "image_edit_context_crop": True,
+    "image_edit_tone_match": True,
     "session_hashes": {},
 }
 

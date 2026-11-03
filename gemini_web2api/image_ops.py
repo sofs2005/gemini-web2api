@@ -262,6 +262,166 @@ def choose_crop_box(bounds: tuple, image_width: int, image_height: int) -> tuple
     return (crop_x0, crop_y0, crop_x0 + crop_width, crop_y0 + crop_height)
 
 
+_CONTEXT_MARGIN = 0.8
+
+
+def context_crop_box(bounds: tuple, image_width: int, image_height: int,
+                     margin_ratio: float = _CONTEXT_MARGIN) -> tuple:
+    """Expand mask bounds with surrounding photo context for a local edit.
+
+    Unlike :func:`choose_crop_box`, which only pads to a supported aspect ratio,
+    this keeps roughly a full selection's worth of real neighbourhood on every
+    side so the model sees the change at a useful pixel budget. The aspect ratio
+    is then aligned to the nearest supported one by expanding, never by cropping
+    into the selection.
+    """
+    x0, y0, x1, y1 = bounds
+    box_width = x1 - x0
+    box_height = y1 - y0
+    if box_width < 1 or box_height < 1:
+        raise ValueError("mask has an empty editable region")
+    if x0 < 0 or y0 < 0 or x1 > image_width or y1 > image_height:
+        raise ValueError("mask bounds exceed the source image")
+
+    margin = int(round(margin_ratio * max(box_width, box_height)))
+    left = max(0, x0 - margin)
+    top = max(0, y0 - margin)
+    right = min(image_width, x1 + margin)
+    bottom = min(image_height, y1 + margin)
+
+    aspect = (right - left) / (bottom - top)
+    target = min(
+        _SUPPORTED_ASPECTS,
+        key=lambda ratio: abs(math.log(aspect / (ratio[0] / ratio[1]))),
+    )
+    target_aspect = target[0] / target[1]
+
+    # Grow the short dimension first; only shrink the long one when the image
+    # edge leaves no room, and never below the selection itself.
+    if aspect < target_aspect:
+        wanted = int(round((bottom - top) * target_aspect))
+        shortage = wanted - (right - left)
+        grow_left = min(shortage // 2, left)
+        left -= grow_left
+        right = min(image_width, left + wanted)
+        left = max(0, right - wanted)
+        if right - left < wanted:
+            bottom = max(y1, top + int(round((right - left) / target_aspect)))
+    else:
+        wanted = int(round((right - left) / target_aspect))
+        shortage = wanted - (bottom - top)
+        grow_top = min(shortage // 2, top)
+        top -= grow_top
+        bottom = min(image_height, top + wanted)
+        top = max(0, bottom - wanted)
+        if bottom - top < wanted:
+            right = max(x1, left + int(round((bottom - top) * target_aspect)))
+    return (left, top, right, bottom)
+
+
+def prepare_context_crop(image_bytes: bytes, mask_bytes: bytes, image_mime: str,
+                         margin_ratio: float = _CONTEXT_MARGIN) -> CropEditPlan:
+    """Crop the selection with generous context and no mask attachment."""
+    geometry = mask_geometry(mask_bytes)
+    _magick_command()
+    crop_box = context_crop_box(
+        geometry.bounds, geometry.width, geometry.height, margin_ratio)
+    crop_x0, crop_y0, crop_x1, crop_y1 = crop_box
+    crop_size = (crop_x1 - crop_x0, crop_y1 - crop_y0)
+
+    with tempfile.TemporaryDirectory(prefix="gemini-context-crop-") as temp_name:
+        temp_dir = Path(temp_name)
+        crop_image = _crop_to_png(
+            image_bytes, _mime_suffix(image_mime), crop_box, temp_dir
+        )
+        mask_source = temp_dir / "mask.png"
+        mask_source.write_bytes(mask_bytes)
+        mask_output = temp_dir / "crop-mask.png"
+        _run_magick([
+            mask_source,
+            "-crop", "%dx%d+%d+%d" % (crop_size[0], crop_size[1], crop_x0, crop_y0),
+            "+repage",
+            mask_output,
+        ])
+        crop_mask = mask_output.read_bytes()
+
+    return CropEditPlan(
+        crop_box=crop_box,
+        crop_size=crop_size,
+        crop_image=crop_image,
+        crop_mask=crop_mask,
+        geometry=geometry,
+    )
+
+
+def _crop_two(tmp_dir: Path, edited_bytes: bytes, edited_mime: str,
+              source_bytes: bytes, source_mime: str, crop_box: tuple):
+    edited_path = tmp_dir / ("tone-edited" + _mime_suffix(edited_mime))
+    source_path = tmp_dir / ("tone-source" + _mime_suffix(source_mime))
+    edited_path.write_bytes(edited_bytes)
+    source_path.write_bytes(source_bytes)
+    x0, y0, x1, y1 = crop_box
+    crop_path = tmp_dir / "tone-crop.png"
+    _run_magick([
+        source_path, "-crop", "%dx%d+%d+%d" % (x1 - x0, y1 - y0, x0, y0),
+        "+repage", crop_path,
+    ])
+    return edited_path, crop_path, x1 - x0, y1 - y0
+
+
+def match_crop_tone(edited_bytes: bytes, edited_mime: str, source_bytes: bytes,
+                    source_mime: str, crop_box: tuple) -> tuple:
+    """Match the edited crop's mean and spread to the original crop.
+
+    A crop regenerated at a small size often comes back with a different
+    exposure or white balance. Aligning per-channel mean and standard deviation
+    keeps the retouch from reading as a pasted rectangle. Returns the edited
+    bytes unchanged when ImageMagick cannot compute the statistics.
+    """
+    output_mime = "image/jpeg" if edited_mime == "image/jpeg" else "image/png"
+    with tempfile.TemporaryDirectory(prefix="gemini-tone-") as temp_name:
+        temp_dir = Path(temp_name)
+        edited_path, crop_path, width, height = _crop_two(
+            temp_dir, edited_bytes, edited_mime, source_bytes, source_mime, crop_box)
+        fitted_path = temp_dir / "tone-fit.png"
+        _run_magick([
+            edited_path,
+            "-resize", "%dx%d^" % (width, height),
+            "-gravity", "center",
+            "-extent", "%dx%d" % (width, height),
+            fitted_path,
+        ])
+        keys = ("mean.r", "mean.g", "mean.b",
+                "standard_deviation.r", "standard_deviation.g", "standard_deviation.b")
+        fmt = " ".join("%%[fx:%s]" % key for key in keys)
+        try:
+            edited_stats = [float(v) for v in _run_magick(
+                [fitted_path, "-format", fmt, "info:"]).decode().split()]
+            source_stats = [float(v) for v in _run_magick(
+                [crop_path, "-format", fmt, "info:"]).decode().split()]
+        except (RuntimeError, ValueError):
+            return edited_bytes, edited_mime
+
+        arguments = [fitted_path]
+        for index, channel in enumerate(("R", "G", "B")):
+            edited_mean, source_mean = edited_stats[index], source_stats[index]
+            edited_dev, source_dev = edited_stats[index + 3], source_stats[index + 3]
+            if edited_dev <= 1e-6 or source_dev <= 1e-6:
+                continue
+            gain = source_dev / edited_dev
+            offset = source_mean - gain * edited_mean
+            arguments += ["-channel", channel,
+                          "-evaluate", "multiply", "%.6f" % gain,
+                          "-evaluate", "add", "%.6f" % offset,
+                          "+channel"]
+        adjusted_path = temp_dir / ("tone-out" + _mime_suffix(output_mime))
+        if output_mime == "image/jpeg":
+            arguments += ["-quality", "95"]
+        arguments.append(adjusted_path)
+        _run_magick(arguments)
+        return adjusted_path.read_bytes(), output_mime
+
+
 def _magick_command() -> str:
     for candidate in ("magick", "convert"):
         path = shutil.which(candidate)
