@@ -3,15 +3,15 @@
 There are two native FreeBSD release archives. Neither requires Docker or root access, and neither includes cookies, credentials, or private configuration.
 
 - `gemini-web2api-serv00.tar.gz`: application source for text serving; install dependencies from PyPI.
-- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.2.0-freebsd14.3-amd64-py311.tar.gz`.
+- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.3.0-freebsd14.3-amd64-py311.tar.gz`.
 
-The formal `v1.2.0` release is built by GitHub Actions. A tag push produces the multi-architecture GHCR image (`ghcr.io/meatroll/gemini-web2api:v1.2.0`) and attaches the FreeBSD native archive (`gemini-web2api-serv00-v1.2.0-freebsd14.3-amd64-py311.tar.gz`) plus its SHA256 file to the GitHub Release. Future releases use the same `vX.Y.Z` tag convention.
+The formal `v1.3.0` release is built by GitHub Actions. A tag push produces the multi-architecture GHCR image (`ghcr.io/meatroll/gemini-web2api:v1.3.0`) and attaches the FreeBSD native archive (`gemini-web2api-serv00-v1.3.0-freebsd14.3-amd64-py311.tar.gz`) plus its SHA256 file to the GitHub Release. Future releases use the same `vX.Y.Z` tag convention.
 
 For a new production installation:
 
 ```sh
 mkdir -p ~/gemini-web2api
-tar -xzf gemini-web2api-serv00-v1.2.0-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
+tar -xzf gemini-web2api-serv00-v1.3.0-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
 cd ~/gemini-web2api
 sh install.sh
 cp config.example.json config.json
@@ -20,7 +20,7 @@ cp config.example.json config.json
 sh start.sh
 ```
 
-For upgrades, retain the existing `config.json`, credentials, model snapshot and cache. Install dependencies in a fresh venv, save the previous code and venv, and stop/switch the API under `.keepalive.lock` so cron cannot race the upgrade. Verify the health endpoint reports 1.2.0 and the current public model-list endpoint works. Neither check sends a Gemini generation request. Do not overwrite the active configuration with either example template.
+For upgrades, retain the existing `config.json`, credentials, model snapshot and cache. Install dependencies in a fresh venv, save the previous code and venv, and stop/switch the API under `.keepalive.lock` so cron cannot race the upgrade. Verify the health endpoint reports 1.3.0 and the current public model-list endpoint works. Neither check sends a Gemini generation request. Do not overwrite the active configuration with either example template.
 
 The image release bundles `curl_cffi 0.16.3` statically linked with upstream `libcurl-impersonate 2.2.2` (BoringSSL). Its build applies only FreeBSD architecture detection and libc++ link flags from upstream. `build-image-runtime.py` pins and verifies both source archives, and records the runtime source and wheel hashes. The installer checks the complete release manifest and all wheel hashes before installing. No library compilation is required when deploying the prepared release.
 
@@ -57,7 +57,13 @@ sh start.sh
 ```
 
 `start.sh` runs the service in the background, while `sh run.sh` runs it in the foreground. `keepalive.sh` uses `flock` to avoid concurrent restarts and can be called from cron every five minutes. Its local health check restarts the service if either the API or the cookie-rotation worker has stopped.
-Set a free port in `config.json` before starting; if exposing a port through serv00, reserve/configure it in the control panel. The template binds to `127.0.0.1` only. Configure authentication and any proxy/tunnel separately before exposing the API. Set `cookie_file` to a path on the server only after uploading credentials securely, and keep those files private. For unattended sessions, set `cookie_rotation_interval_sec` to `300`; the service calls Google's RotateCookies endpoint and atomically updates the JSON cookie file with mode 0600. Rotation requires a fresh authenticated export to start and cannot revive a rejected session. Stop the foreground process with Ctrl-C.
+Set a free port in `config.json` before starting; if exposing a port through serv00, reserve/configure it in the control panel. The template binds to `127.0.0.1` only. Configure authentication and any proxy/tunnel separately before exposing the API.
+
+Generated images are returned as `b64_json`. The service does not host image files, so
+`response_format=url` returns a standard `unsupported_value` error. Decode the base64
+response and store it in your own application if a public link is required.
+
+Set `cookie_file` to a path on the server only after uploading credentials securely, and keep those files private. For unattended sessions, set `cookie_rotation_interval_sec` to `300`; the service calls Google's RotateCookies endpoint and atomically updates the JSON cookie file with mode 0600. Rotation requires a fresh authenticated export to start and cannot revive a rejected session. Stop the foreground process with Ctrl-C.
 
 The modular service also supports model change monitoring. The default `model_check_interval_sec` is `86400` (one day); set it to `0` to disable monitoring. Set `model_snapshot_file` to an absolute writable path such as `/home/igsshan/gemini-web2api/gemini-models.json`. With an authentication export configured and no saved attempt, the first start immediately reads the model list and establishes the daily cycle. Subsequent starts respect the saved schedule. The minimum enabled interval is one hour. Each due check makes only one model-list RPC request, never a generation request. Both successful and failed attempt times persist across restarts. A private atomic snapshot records the current models and latest additions, removals, renames, and metadata changes; authentication failures leave the valid baseline intact. Events are logged even when request logging is disabled. The valid snapshot drives `/v1/models`, `/v1beta/models`, and complete model selection headers for generation, without extra discovery requests. Refresh the channel model list in New API after updating the service. See the main README for the full configuration and state fields.
 

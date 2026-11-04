@@ -251,6 +251,7 @@ curl http://localhost:8082/v1/chat/completions \
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "image_request_budget_sec": 900,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -393,22 +394,56 @@ resp = client.chat.completions.create(
 
 ## 图片输出
 
-模块版服务支持 `POST /v1/images/generations`，接受 `prompt`、`n: 1` 和
-`response_format`（`b64_json` 或 `url`）。图片请求使用 Gemini Web 专用的浏览器请求格式，
-返回一个 OpenAI 兼容的图片结果。为兼容标准 OpenAI Images 客户端，也接受 `size`、`quality`、
-`style`、`background` 等常见参数，但这些参数目前由 Gemini 后端忽略。不支持 `stream` 和多图输出。
+模块版服务支持 `POST /v1/images/generations`，接受 `prompt`、`model`（必填）、`n`（1-10）和
+`response_format`（仅 `b64_json`）。图片请求使用 Gemini Web 专用的浏览器请求格式。
+`size` 会被校验并转换成明确的宽高比提示词；当主机安装了 ImageMagick 时，还会把结果
+缩放/裁切到请求的尺寸。响应会返回可确定的实际 `size`（包括省略 `size` 或 `auto` 的情况）
+和实际的 `output_format`。如果 ImageMagick 不可用，响应返回真实尺寸，而不是虚报请求尺寸。`n > 1` 时，只有所有输出
+的实际尺寸一致才返回响应级 `size`；尺寸不一致时省略该字段。`n` 会执行 n 次独立的上游生成，
+延迟和 Gemini 配额消耗近似线性增长；没有 seed 或 batch 模式，因此不保证多张图视觉一致。
+`image_request_budget_sec`（默认 900，设为 `0` 关闭）限制整个 Images 请求的总时间，包括单图
+重试和生成图下载；超时返回 HTTP 504，`type=server_error, code=request_timeout`。
+响应还带一个代理侧估算的 `usage`：文本 token 为 `ceil(UTF-8 字节数 / 4)`，图片 token 为每个
+输入附件或输出图片的 `ceil(宽/32) * ceil(高/32)`。这是确定性估算，不是 OpenAI 或 Gemini
+分词器的真实计数，请勿用于计费。`model` 在 generations 和 multipart edits 中必填。OpenAI 图片模型名（`gpt-image-*`、
+`chatgpt-image-latest`、旧版 `dall-e-*`）会被接受并映射到同一个 Gemini 图片管线；
+Gemini 模型名和 16 位 upstream ID 也接受，但不改变图片后端；其他名称返回 `model_not_found`。
+JSON edits 省略 `model` 时默认使用 `gpt-image-2.5-sunburst`。
+`quality`、`style`、`moderation`、
+`input_fidelity`、`safety_identifier` 等参数会被接受并校验，但 Gemini 后端不会应用它们。
+`background=opaque/auto` 接受但不处理；`background=transparent` 会返回 `unsupported_value`，
+因为服务无法保证输出带 alpha 通道；
+`output_compression` 会在通过 ImageMagick 输出 JPEG/WebP 时生效。不支持 `stream`，会返回带 `param: "stream"` 的标准 OpenAI 错误。
+`partial_images` 会接受并校验 0–3，但不生效，因为后端只返回最终图片。
+所有 OpenAI 兼容的 `/v1` 接口都使用 `ErrorResponse` 结构（`type`、`message`、`param`、`code`），
+所有响应都带 `x-request-id`。错误类型按 HTTP 状态映射：400/422 为
+`invalid_request_error`，401 为 `authentication_error`，403 为 `permission_error`，404 为
+`invalid_request_error`，429 为 `rate_limit_error`，5xx 为 `server_error`。代理特有的原因
+（如 `tool_call_parse_error`、`upstream_temporary_refusal`）放在 `code`；`retryable`
+保留为扩展字段。`/v1beta/*` 继续返回 Google 风格错误对象，以兼容 Gemini CLI。
 
-模块版服务还支持 OpenAI 兼容的 `POST /v1/images/edits` multipart 请求：必须提供
-`image` 和 `prompt`，可选 `mask`，只支持 `n: 1`。源图和 mask 会上传到 Gemini 并发送给专用图片路由；
-提供 mask 时，mask 必须是带 alpha 通道的 PNG，并且和源图尺寸一致。目前支持从 PNG、JPEG、GIF、BMP 或 WebP 源图读取尺寸。
-不透明区域会尽量保留。Gemini Web 没有单独的 mask 参数，因此服务会把 mask 作为第二张附件上传，
-并在提示词中说明 alpha 区域语义。每张图片限制为 10 MiB。`response_format` 支持 `b64_json` 或 `url`，其中 `url`
-返回服务端生成的 data URL。为兼容客户端，也接受 `size`、`quality`、`input_fidelity` 等常见参数，但
-Gemini 后端目前会忽略这些参数。不支持 `stream` 和多图输出。
+模块版服务还支持 OpenAI 兼容的 `POST /v1/images/edits`，可使用 multipart 或 JSON 请求体。
+multipart 模式下必须提供 `image`、`prompt` 和 `model`，`mask` 可选；只支持一张 `image`，
+多图请求返回标准 `unsupported_value` 错误。JSON 模式接受单元素
+`images: [{"image_url": ...}]`，支持 HTTPS 或 base64 data URL；
+`file_id` 引用会拒绝，因为本服务没有实现 OpenAI Files API。提供 mask 时，mask 必须是
+带 alpha 通道的 PNG，并且和源图尺寸一致。
+目前支持从 PNG、JPEG 或 WebP 源图读取尺寸。不透明区域会尽量保留。Gemini Web
+没有单独的 mask 参数，因此服务会把 mask 作为附件上传，并在提示词中说明 alpha 区域语义。
+multipart 每张图片限制 50 MiB，mask 限制 4 MiB；JSON 的远程 HTTPS 图片仍受 10 MiB 下载上限约束。
+`prompt` 限制 32000 字符。`response_format` 仅支持 `b64_json`。传 `url` 会返回标准的 `unsupported_value` 错误，
+因为本服务不托管生成图片。如果确实需要公网链接，请自行解码 `b64_json` 后保存到你的存储或 CDN。
+`n`（1-10）、`size`、`output_format`
+会被执行（与 generations 相同，依赖 ImageMagick 可用）。`quality`、`moderation`、
+`input_fidelity` 为兼容客户端而接受，但会被忽略；`background=transparent` 会返回
+`unsupported_value`，`background=opaque/auto` 接受但不处理；`output_compression` 会应用到
+JPEG/WebP 输出。`markup` 不支持，会返回标准的 `unsupported_value` 错误。不支持 `stream`；
+`partial_images` 接受但不生效。
 
 ```bash
 curl http://localhost:8081/v1/images/edits \\
   -H "Authorization: Bearer sk-your-key" \\
+  -F "model=gpt-image-1" \\
   -F "image=@source.png" \\
   -F "mask=@mask.png" \\
   -F "prompt=把天空替换成日落" \\
@@ -420,6 +455,7 @@ Responses API 的 `tools` 中也支持 `{"type": "image_generation"}`，返回�
 并返回 Markdown 图片 URL。
 
 生成图片的下载地址会限制在经过校验的 Google 图片域名，并限制重定向次数、文件大小和图片文件头。
+服务不托管生成图片，因此不支持 `response_format=url`；请自行解码 `b64_json` 后保存或提供下载。
 
 ## 已知限制
 

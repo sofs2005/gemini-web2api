@@ -626,10 +626,20 @@ def extract_response_text(raw: str) -> str:
     return clean_text(selected)
 
 
-def _generate_image_raw_with_curl(prompt: str, file_refs: list = None) -> str:
-    """Send the dedicated GUI-equivalent image-generation request via Chrome TLS."""
+def _generate_image_raw_with_curl(prompt: str, file_refs: list = None, *,
+                                  budget_sec=None) -> str:
+    """Send the dedicated GUI-equivalent image-generation request via Chrome TLS.
+
+    ``budget_sec`` bounds the complete generation call, including image RPC
+    retries. A caller handling multiple images can pass its remaining request
+    budget so that one image cannot consume the whole ``n`` request allowance.
+    """
     if not HAS_CURL_CFFI:
         raise RuntimeError("curl_cffi is required for Gemini image generation")
+
+    started = time.monotonic()
+    deadline = started + float(budget_sec) if budget_sec is not None else None
+    configured_timeout = max(0.001, float(CONFIG["request_timeout_sec"]))
 
     from .multimodal import _cached_page_tokens
     page_tokens = _cached_page_tokens(max_age=0)
@@ -643,30 +653,44 @@ def _generate_image_raw_with_curl(prompt: str, file_refs: list = None) -> str:
     request_args = {
         "data": body,
         "headers": headers,
-        "timeout": CONFIG["request_timeout_sec"],
         "impersonate": "chrome",
     }
     if CONFIG.get("proxy"):
         request_args["proxy"] = CONFIG["proxy"]
 
+    attempts = max(1, int(CONFIG["retry_attempts"]))
     last_err = None
-    for attempt in range(max(1, CONFIG["retry_attempts"])):
+    for attempt in range(attempts):
         try:
+            timeout = configured_timeout
+            if deadline is not None:
+                timeout = min(timeout, deadline - time.monotonic())
+                if timeout <= 0:
+                    raise TimeoutError("Image generation budget exhausted")
+            request_args["timeout"] = timeout
             response = curl_requests.post(_get_url(page_tokens.get("f_sid")), **request_args)
             response.raise_for_status()
             return response.text
         except Exception as exc:
             last_err = exc
-            if attempt < max(1, CONFIG["retry_attempts"]) - 1:
-                log(f"Image generation retry {attempt + 1}/{CONFIG['retry_attempts']}: {exc}")
-                time.sleep(_retry_delay(attempt))
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Image generation budget exhausted") from exc
+            if attempt < attempts - 1:
+                delay = _retry_delay(attempt)
+                if deadline is not None and time.monotonic() + delay >= deadline:
+                    raise TimeoutError("Image generation budget exhausted") from exc
+                log(f"Image generation retry {attempt + 1}/{attempts}: {exc}")
+                time.sleep(delay)
     raise last_err
 
 
-def generate_image_structured(prompt: str, file_refs: list = None) -> GenerationResult:
+def generate_image_structured(prompt: str, file_refs: list = None, *,
+                              budget_sec=None) -> GenerationResult:
     """Generate an image and return rich metadata, optionally using attachments."""
-    raw = (_generate_image_raw_with_curl(prompt, file_refs=file_refs)
-           if file_refs else _generate_image_raw_with_curl(prompt))
+    raw = (_generate_image_raw_with_curl(
+        prompt, file_refs=file_refs, budget_sec=budget_sec)
+        if file_refs else _generate_image_raw_with_curl(
+            prompt, budget_sec=budget_sec))
     return extract_generation_result(raw, clean_text)
 
 

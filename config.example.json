@@ -5,6 +5,7 @@
   "retry_delay_sec": 5,
   "retry_delay_max_sec": 30,
   "request_timeout_sec": 300,
+  "image_request_budget_sec": 900,
   "agent_request_budget_sec": 300,
   "stream_heartbeat_sec": 10,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",

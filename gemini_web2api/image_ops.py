@@ -631,6 +631,38 @@ def image_dimensions(image_bytes: bytes, image_mime: str) -> tuple:
     return int(parts[0]), int(parts[1])
 
 
+def fit_image_size(image_bytes: bytes, image_mime: str, width: int, height: int,
+                   output_format: str = None, compression: int = None) -> tuple:
+    """Resize and center-crop an image to the requested output dimensions."""
+    output_mime = {
+        "png": "image/png",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "webp": "image/webp",
+    }.get((output_format or "").lower(), image_mime)
+    suffix = _mime_suffix(output_mime)
+    with tempfile.TemporaryDirectory(prefix="gemini-fit-") as temp_name:
+        temp_dir = Path(temp_name)
+        source_path = temp_dir / ("source" + _mime_suffix(image_mime))
+        output_path = temp_dir / ("output" + suffix)
+        source_path.write_bytes(image_bytes)
+        arguments = [
+            source_path,
+            "-resize", "%dx%d^" % (width, height),
+            "-gravity", "center",
+            "-extent", "%dx%d" % (width, height),
+        ]
+        if output_mime == "image/jpeg":
+            arguments += ["-quality", str(compression if compression is not None else 95)]
+        elif output_mime == "image/webp" and compression is not None:
+            arguments += ["-quality", str(compression)]
+        arguments.append(output_path)
+        _run_magick(arguments)
+        if not output_path.is_file():
+            raise RuntimeError("ImageMagick did not create the sized image")
+        return output_path.read_bytes(), output_mime
+
+
 def thumbnail_mask_stats(source_bytes, source_mime, edited_bytes, edited_mime, mask_bytes,
                          grid=_DRIFT_GRID):
     """Compare a thumbnail of the raw model output against the source.

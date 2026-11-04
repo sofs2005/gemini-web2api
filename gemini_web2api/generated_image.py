@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -373,7 +374,17 @@ def _limits() -> tuple[int, int]:
     return max_bytes, max_redirects
 
 
-def _request_args(stream: bool, url: str | None = None) -> dict:
+def _request_timeout(deadline=None):
+    configured = max(0.001, float(CONFIG["request_timeout_sec"]))
+    if deadline is None:
+        return configured
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("generated image request budget exhausted")
+    return min(configured, remaining)
+
+
+def _request_args(stream: bool, url: str | None = None, *, deadline=None) -> dict:
     """Build the minimal media request with host-scoped login Cookie."""
     headers = {}
     if url:
@@ -388,7 +399,7 @@ def _request_args(stream: bool, url: str | None = None) -> dict:
                 headers["Cookie"] = cookie
     args = {
         "headers": headers,
-        "timeout": CONFIG["request_timeout_sec"],
+        "timeout": _request_timeout(deadline),
         "impersonate": "chrome",
         "default_headers": False,
         "allow_redirects": False,
@@ -428,7 +439,7 @@ def _read_mediator_url(response) -> str:
     return url
 
 
-def resolve_generated_image_url(url: str) -> str:
+def resolve_generated_image_url(url: str, *, deadline=None) -> str:
     """Resolve Gemini's bounded text mediators to a final image URL.
 
     Gemini Web adds ``alr=yes`` and follows up to two text/plain hops before
@@ -446,7 +457,8 @@ def resolve_generated_image_url(url: str) -> str:
     while True:
         _diagnostic_log("resolve_request hop=%s mediator=%s %s" % (
             redirects, current_is_mediator, _url_debug(current)))
-        response = curl_requests.get(current, **_request_args(stream=True, url=current))
+        response = curl_requests.get(
+            current, **_request_args(stream=True, url=current, deadline=deadline))
         try:
             _diagnostic_log("resolve_response hop=%s %s %s" % (
                 redirects, _url_debug(current), _response_debug(response)))
@@ -481,15 +493,16 @@ def resolve_generated_image_url(url: str) -> str:
                 close()
 
 
-def download_generated_image(url: str) -> tuple[bytes, str]:
+def download_generated_image(url: str, *, deadline=None) -> tuple[bytes, str]:
     """Download a resolved generated image with verified image bytes."""
-    final_url = resolve_generated_image_url(url)
+    final_url = resolve_generated_image_url(url, deadline=deadline)
     _diagnostic_log("download_resolved source=%s final=%s" % (_url_debug(url), _url_debug(final_url)))
     max_bytes, max_redirects = _limits()
     current = final_url
     for hop in range(max_redirects + 1):
         _diagnostic_log("download_request hop=%s %s" % (hop, _url_debug(current)))
-        response = curl_requests.get(current, **_request_args(stream=True, url=current))
+        response = curl_requests.get(
+            current, **_request_args(stream=True, url=current, deadline=deadline))
         try:
             _diagnostic_log("download_response hop=%s %s %s" % (
                 hop, _url_debug(current), _response_debug(response)))

@@ -6,6 +6,7 @@ import os
 import struct
 import tempfile
 import threading
+import time
 import unittest
 import zlib
 from unittest import mock
@@ -15,7 +16,11 @@ from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api import gemini, rotation
 from gemini_web2api.cache import CACHE
 from gemini_web2api.gemini import _build_payload
-from gemini_web2api.server import GeminiHandler, ThreadedServer, _classify_response_quality, _crop_edit_prompt, _edit_prompt
+from gemini_web2api.server import (
+    GeminiHandler, ThreadedServer, _classify_response_quality, _common_actual_size,
+    _crop_edit_prompt, _edit_prompt, _image_budget_remaining,
+    _image_request_deadline, _openai_error_payload,
+)
 from gemini_web2api.image_ops import ImageOpsUnavailable, choose_crop_box, mask_geometry
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
 
@@ -564,6 +569,116 @@ class StreamingEndpointTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
+    @mock.patch("gemini_web2api.gemini.HAS_CURL_CFFI", True)
+    @mock.patch("gemini_web2api.multimodal._cached_page_tokens",
+                return_value={"at": "token", "f_sid": "sid"})
+    @mock.patch("gemini_web2api.gemini._build_image_payload", return_value=b"body")
+    @mock.patch("gemini_web2api.gemini._build_headers", return_value={})
+    @mock.patch("gemini_web2api.gemini._image_model_headers", return_value={})
+    @mock.patch("gemini_web2api.gemini.curl_requests.post")
+    def test_image_generation_budget_zero_skips_upstream_request(
+        self, post, _model_headers, _headers, _payload, _tokens
+    ):
+        with self.assertRaises(TimeoutError):
+            gemini._generate_image_raw_with_curl("a red fox", budget_sec=0)
+        post.assert_not_called()
+
+    def test_image_request_budget_helpers(self):
+        self.assertIsNone(_image_budget_remaining(None))
+        self.assertGreater(
+            _image_budget_remaining(time.monotonic() + 10), 0)
+        with self.assertRaises(TimeoutError):
+            _image_budget_remaining(time.monotonic() - 1)
+        with mock.patch.dict(CONFIG, {"image_request_budget_sec": 0}):
+            self.assertIsNone(_image_request_deadline())
+        with mock.patch.dict(CONFIG, {"image_request_budget_sec": 5}):
+            self.assertGreater(_image_request_deadline(), time.monotonic())
+
+        self.assertEqual(_common_actual_size([(2, 2), (2, 2)]), (2, 2))
+        self.assertIsNone(_common_actual_size([(2, 2), (3, 3)]))
+        self.assertIsNone(_common_actual_size([(2, 2), None]))
+        self.assertIsNone(_common_actual_size([]))
+
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_budget_exhaustion_returns_504(self, generate):
+        with mock.patch(
+            "gemini_web2api.server._image_request_deadline",
+            return_value=time.monotonic() - 1,
+        ):
+            status, _, body = self.post_json("/v1/images/generations", {
+                "prompt": "a red fox", "model": "gpt-image-1", "n": 2,
+            })
+        self.assertEqual(status, 504)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "server_error")
+        self.assertEqual(error["code"], "request_timeout")
+        generate.assert_not_called()
+
+    def test_openai_error_payload_status_mapping(self):
+        cases = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "invalid_request_error",
+            422: "invalid_request_error",
+            429: "rate_limit_error",
+            500: "server_error",
+            502: "server_error",
+            503: "server_error",
+        }
+        for status, expected_type in cases.items():
+            with self.subTest(status=status):
+                error = _openai_error_payload(
+                    "failure", status, param="model", code="example",
+                    retryable=True)["error"]
+                self.assertEqual(error, {
+                    "type": expected_type,
+                    "message": "failure",
+                    "param": "model",
+                    "code": "example",
+                    "retryable": True,
+                })
+
+    def test_google_routes_keep_google_error_schema(self):
+        CONFIG["api_keys"] = ["secret"]
+        status, _, body = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:generateContent", {})
+        self.assertEqual(status, 401)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], 401)
+        self.assertEqual(error["message"], "invalid api key")
+        self.assertEqual(error["status"], "UNAUTHENTICATED")
+        self.assertNotIn("type", error)
+
+        CONFIG["api_keys"] = []
+        status, _, body = self.post_json("/v1beta/not-a-route", {})
+        self.assertEqual(status, 404)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], 404)
+        self.assertEqual(error["message"], "not found")
+        self.assertEqual(error["status"], "NOT_FOUND")
+        self.assertNotIn("type", error)
+
+    def test_auth_and_404_use_openai_error_schema(self):
+        CONFIG["api_keys"] = ["secret"]
+        status, headers, body = self.post_json("/v1/chat/completions", {})
+        self.assertEqual(status, 401)
+        self.assertTrue(headers.get("x-request-id") or headers.get("X-Request-Id"))
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "authentication_error")
+        self.assertEqual(error["message"], "invalid api key")
+        self.assertIsNone(error["param"])
+        self.assertEqual(error["code"], "invalid_api_key")
+
+        CONFIG["api_keys"] = []
+        status, _, body = self.post_json("/v1/not-a-route", {})
+        self.assertEqual(status, 404)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["message"], "not found")
+        self.assertIsNone(error["param"])
+        self.assertEqual(error["code"], "not_found")
+
     @mock.patch("gemini_web2api.server.generate", side_effect=TimeoutError("budget exhausted"))
     def test_agent_timeout_returns_504(self, generate):
         CONFIG["agent_request_budget_sec"] = 300
@@ -602,7 +717,9 @@ class StreamingEndpointTests(unittest.TestCase):
                     input_key: [{"role": "user", "content": "read"}], "tools": tools,
                 })
                 self.assertEqual(status, 502)
-                self.assertEqual(json.loads(body)["error"]["type"], "tool_call_parse_error")
+                error = json.loads(body)["error"]
+                self.assertEqual(error["type"], "server_error")
+                self.assertEqual(error["code"], "tool_call_parse_error")
 
     @mock.patch("gemini_web2api.server.generate")
     def test_client_operation_preserves_multiline_arguments_and_schema_validation(self, generate):
@@ -635,7 +752,9 @@ class StreamingEndpointTests(unittest.TestCase):
                     input_key: [{"role": "user", "content": "write"}], "tools": tools,
                 })
                 self.assertEqual(status, 502)
-                self.assertEqual(json.loads(body)["error"]["type"], "tool_call_parse_error")
+                error = json.loads(body)["error"]
+                self.assertEqual(error["type"], "server_error")
+                self.assertEqual(error["code"], "tool_call_parse_error")
 
     @mock.patch("gemini_web2api.server.generate", return_value="I seem to be encountering an error. Can I try something else for you?")
     def test_temporary_refusal_returns_error_on_both_endpoints(self, generate):
@@ -645,7 +764,9 @@ class StreamingEndpointTests(unittest.TestCase):
                 "tools": [{"type": "function", "function": {"name": "read"}}],
             })
             self.assertEqual(status, 503)
-            self.assertEqual(json.loads(body)["error"]["type"], "upstream_temporary_refusal")
+            error = json.loads(body)["error"]
+            self.assertEqual(error["type"], "server_error")
+            self.assertEqual(error["code"], "upstream_temporary_refusal")
         self.assertEqual(_classify_response_quality("", 'Quoted: I seem to be encountering an error.', True), "normal")
         self.assertEqual(_classify_response_quality("", "I couldn't do that because it is unsafe.", True), "normal")
 
@@ -694,6 +815,8 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(final_args["headers"], {})
         self.assertFalse(mediator_args["default_headers"])
         self.assertFalse(final_args["default_headers"])
+        with self.assertRaises(TimeoutError):
+            _request_args(stream=True, deadline=time.monotonic() - 1)
 
     def test_full_size_payload_reserializes_response_context_as_sparse_jspb(self):
         from gemini_web2api.generated_image import GeneratedImage
@@ -771,38 +894,101 @@ class StreamingEndpointTests(unittest.TestCase):
             images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
         )
         status, _, body = self.post_json("/v1/images/generations", {
-            "prompt": "a red fox", "response_format": "b64_json",
+            "prompt": "a red fox", "model": "gpt-image-1",
+            "response_format": "b64_json",
             "size": "1024x1024", "quality": "high", "background": "opaque",
         })
         self.assertEqual(status, 200)
         self.assertEqual(download_generated_image.call_args_list, [
-            mock.call("https://lh3.googleusercontent.com/full"),
-            mock.call("https://lh3.googleusercontent.com/generated"),
+            mock.call("https://lh3.googleusercontent.com/full", deadline=mock.ANY),
+            mock.call("https://lh3.googleusercontent.com/generated", deadline=mock.ANY),
         ])
-        generate_image_structured.assert_called_once_with("a red fox")
+        generate_image_structured.assert_called_once()
+        self.assertIn("a red fox", generate_image_structured.call_args.args[0])
+        self.assertIn("1024x1024", generate_image_structured.call_args.args[0])
 
-    @mock.patch(
-        "gemini_web2api.server.download_generated_image",
-        return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
-    )
-    @mock.patch("gemini_web2api.server.get_full_size_image", return_value="https://lh3.googleusercontent.com/raw")
+    @mock.patch("gemini_web2api.server.download_generated_image",
+                return_value=(_png_bytes(64, 32), "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
     @mock.patch("gemini_web2api.server.generate_image_structured")
-    def test_image_generation_url_returns_server_owned_data_url(
-        self, generate_image_structured, _full_size, download_generated_image
+    def test_image_generation_reports_estimated_usage(
+        self, generate_image_structured, _full_size, _download
     ):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
         generate_image_structured.return_value = GenerationResult(
-            images=[GeneratedImage("https://lh3.googleusercontent.com/preview")]
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
         )
         status, _, body = self.post_json("/v1/images/generations", {
-            "prompt": "a red fox", "response_format": "url",
+            "prompt": "a red fox", "model": "gpt-image-1",
         })
         self.assertEqual(status, 200)
-        returned_url = json.loads(body)["data"][0]["url"]
-        self.assertTrue(returned_url.startswith("data:image/png;base64,"))
-        self.assertNotIn("googleusercontent.com", returned_url)
-        download_generated_image.assert_called_once_with("https://lh3.googleusercontent.com/raw")
+        payload = json.loads(body)
+        self.assertEqual(payload["size"], "64x32")
+        usage = payload["usage"]
+        self.assertEqual(usage, {
+            "total_tokens": 5,
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "input_tokens_details": {"text_tokens": 3, "image_tokens": 0},
+            "output_tokens_details": {"text_tokens": 0, "image_tokens": 2},
+        })
 
+    @mock.patch("gemini_web2api.server.download_generated_image",
+                return_value=(_png_bytes(64, 32), "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_edit_reports_estimated_usage(
+        self, generate_image_structured, _full_size, _download
+    ):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        with mock.patch(
+            "gemini_web2api.server.upload_image", return_value="/uploaded/source"
+        ):
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "edit this", "model": "gpt-image-1"},
+                files={"image": ("source.png", _png_bytes(64, 32), "image/png")},
+            )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["size"], "64x32")
+        usage = payload["usage"]
+        self.assertEqual(usage, {
+            "total_tokens": 7,
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "input_tokens_details": {"text_tokens": 3, "image_tokens": 2},
+            "output_tokens_details": {"text_tokens": 0, "image_tokens": 2},
+        })
+
+    def test_image_usage_estimator_uses_utf8_text_and_pixel_patches(self):
+        from gemini_web2api.server import _image_usage
+        usage = _image_usage("你好", input_sizes=[(64, 32)], output_sizes=[(32, 32)])
+        self.assertEqual(usage["input_tokens_details"], {
+            "text_tokens": 2, "image_tokens": 2,
+        })
+        self.assertEqual(usage["output_tokens_details"], {
+            "text_tokens": 0, "image_tokens": 1,
+        })
+        self.assertEqual(usage["total_tokens"], 5)
+
+    def test_image_generation_rejects_url_response_format(self):
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, headers, body = self.post_json("/v1/images/generations", {
+                "prompt": "a red fox", "model": "gpt-image-1",
+                "response_format": "url",
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "response_format")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertIn("b64_json", error["message"])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+        generate.assert_not_called()
 
     def test_image_edit_endpoint_uploads_source_and_mask(self):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
@@ -920,7 +1106,7 @@ class StreamingEndpointTests(unittest.TestCase):
         ) as composite_crop_edit:
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                fields={"prompt": "add a gull", "model": "gpt-image-1", "response_format": "b64_json"},
                 files={
                     "image": ("source.png", source, "image/png"),
                     "mask": ("mask.png", mask, "image/png"),
@@ -1024,7 +1210,7 @@ class StreamingEndpointTests(unittest.TestCase):
         ) as composite_crop_edit:
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "add gulls", "response_format": "b64_json"},
+                fields={"prompt": "add gulls", "model": "gpt-image-1", "response_format": "b64_json"},
                 files={
                     "image": ("source.png", source, "image/png"),
                     "mask": ("mask.png", mask, "image/png"),
@@ -1091,14 +1277,14 @@ class StreamingEndpointTests(unittest.TestCase):
         ) as composite_crop_edit:
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                fields={"prompt": "add a gull", "model": "gpt-image-1", "response_format": "b64_json"},
                 files={
                     "image": ("source.png", source, "image/png"),
                     "mask": ("mask.png", mask, "image/png"),
                 },
             )
 
-        self.assertEqual(status, 502)
+        self.assertEqual(status, 500)
         self.assertIn("reframed", json.loads(body)["error"]["message"])
         composite_crop_edit.assert_not_called()
 
@@ -1135,7 +1321,7 @@ class StreamingEndpointTests(unittest.TestCase):
         ) as composite_crop_edit:
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                fields={"prompt": "add a gull", "model": "gpt-image-1", "response_format": "b64_json"},
                 files={
                     "image": ("source.png", source, "image/png"),
                     "mask": ("mask.png", mask, "image/png"),
@@ -1190,7 +1376,7 @@ class StreamingEndpointTests(unittest.TestCase):
         ) as composite_crop_edit:
             status, _, _body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "add a gull", "response_format": "b64_json"},
+                fields={"prompt": "add a gull", "model": "gpt-image-1", "response_format": "b64_json"},
                 files={
                     "image": ("source.png", source, "image/png"),
                     "mask": ("mask.png", mask, "image/png"),
@@ -1283,7 +1469,7 @@ class StreamingEndpointTests(unittest.TestCase):
         ) as composite_crop_edit:
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "add a surfer", "response_format": "b64_json"},
+                fields={"prompt": "add a surfer", "model": "gpt-image-1", "response_format": "b64_json"},
                 files={
                     "image": ("source.png", source, "image/png"),
                     "mask": ("mask.png", mask, "image/png"),
@@ -1311,7 +1497,7 @@ class StreamingEndpointTests(unittest.TestCase):
     def test_image_edit_endpoint_rejects_mask_without_transparent_pixels(self):
         status, _, body = self.post_multipart(
             "/v1/images/edits",
-            fields={"prompt": "edit this"},
+            fields={"prompt": "edit this", "model": "gpt-image-1"},
             files={
                 "image": ("source.png", _png_bytes(2, 2), "image/png"),
                 "mask": ("mask.png", _mask_png(2, 2), "image/png"),
@@ -1329,16 +1515,18 @@ class StreamingEndpointTests(unittest.TestCase):
 
         status, _, body = self.post_multipart(
             "/v1/images/edits",
-            fields={"prompt": "edit this", "n": "2"},
-            files={"image": ("source.png", b"fake", "image/png")},
+            fields={"prompt": "edit this", "model": "gpt-image-1", "n": "11"},
+            files={"image": ("source.png", _png_bytes(2, 2), "image/png")},
         )
         self.assertEqual(status, 400)
-        self.assertIn("only n=1", json.loads(body)["error"]["message"])
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "n")
+        self.assertEqual(error["type"], "invalid_request_error")
 
     def test_image_edit_endpoint_rejects_mask_without_alpha(self):
         status, _, body = self.post_multipart(
             "/v1/images/edits",
-            fields={"prompt": "edit this"},
+            fields={"prompt": "edit this", "model": "gpt-image-1"},
             files={
                 "image": ("source.png", _png_bytes(2, 2), "image/png"),
                 "mask": ("mask.png", _png_bytes(2, 2, alpha=False), "image/png"),
@@ -1350,7 +1538,7 @@ class StreamingEndpointTests(unittest.TestCase):
     def test_image_edit_endpoint_rejects_mismatched_mask_dimensions(self):
         status, _, body = self.post_multipart(
             "/v1/images/edits",
-            fields={"prompt": "edit this"},
+            fields={"prompt": "edit this", "model": "gpt-image-1"},
             files={
                 "image": ("source.png", _png_bytes(2, 2), "image/png"),
                 "mask": ("mask.png", _png_bytes(1, 1), "image/png"),
@@ -1359,30 +1547,471 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("dimensions must match", json.loads(body)["error"]["message"])
 
+    def test_image_edit_endpoint_rejects_url_response_format(self):
+        source = _png_bytes(2, 2)
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, headers, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={
+                    "prompt": "make it brighter",
+                    "model": "gpt-image-1",
+                    "response_format": "url",
+                },
+                files={"image": ("source.png", source, "image/png")},
+            )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "response_format")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertIn("b64_json", error["message"])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+        generate.assert_not_called()
+
+    def test_image_edit_rejects_url_response_format_in_json(self):
+        source = _png_bytes(2, 2)
+        data_url = "data:image/png;base64," + base64.b64encode(source).decode()
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, _, body = self.post_json("/v1/images/edits", {
+                "prompt": "edit this", "model": "gpt-image-1",
+                "images": [{"image_url": data_url}],
+                "response_format": "url",
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "response_format")
+        self.assertEqual(error["code"], "unsupported_value")
+        generate.assert_not_called()
+
+    def test_image_generation_rejects_transparent_background(self):
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, headers, body = self.post_json("/v1/images/generations", {
+                "prompt": "a red fox", "model": "gpt-image-1",
+                "background": "transparent", "output_format": "png",
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "background")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertIn("opaque", error["message"])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+        generate.assert_not_called()
+
+    def test_image_edit_rejects_transparent_background(self):
+        source = _png_bytes(2, 2)
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={
+                    "prompt": "edit this",
+                    "model": "gpt-image-1",
+                    "background": "transparent",
+                },
+                files={"image": ("source.png", source, "image/png")},
+            )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "background")
+        self.assertEqual(error["code"], "unsupported_value")
+        generate.assert_not_called()
+
+    def test_image_endpoint_errors_use_openai_schema_and_request_id(self):
+        status, headers, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "model": "gpt-image-1", "size": "not-a-size",
+        })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "size")
+        self.assertEqual(error["code"], "invalid_value")
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+
+        status, headers, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "model": "gpt-image-1", "stream": True,
+        })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "stream")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+
+    @mock.patch("gemini_web2api.server.download_generated_image",
+                return_value=(_png_bytes(2, 2), "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
     @mock.patch("gemini_web2api.server.generate_image_structured")
-    def test_image_edit_endpoint_returns_server_owned_url_data(self, generate_image_structured):
+    def test_image_generation_accepts_nullable_and_compat_fields(
+        self, generate_image_structured, _full_size, _download
+    ):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
         generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
+        )
+        with mock.patch("gemini_web2api.server.fit_image_size",
+                        side_effect=lambda data, mime, width, height, fmt=None, compression=None: (data, mime)):
+            status, _, body = self.post_json("/v1/images/generations", {
+                "prompt": "a red fox", "model": "gpt-image-1",
+                "stream": False, "n": None, "response_format": None,
+                "safety_identifier": "user-1", "partial_images": 0,
+            })
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["data"]), 1)
+        self.assertIn("b64_json", payload["data"][0])
+
+    @mock.patch("gemini_web2api.server._native_image_size", return_value=(1536, 1024))
+    @mock.patch("gemini_web2api.server.fit_image_size",
+                side_effect=lambda data, mime, width, height, fmt=None, compression=None: (data, mime))
+    @mock.patch("gemini_web2api.server.download_generated_image",
+                return_value=(_png_bytes(2, 2), "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_generation_supports_multiple_outputs_and_size(
+        self, generate_image_structured, _full_size, _download, _fit, _native
+    ):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
+        )
+        status, _, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "model": "gpt-image-1",
+            "n": 2, "size": "1536x1024",
+        })
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["data"]), 2)
+        self.assertEqual(payload["size"], "1536x1024")
+        self.assertEqual(payload["output_format"], "png")
+        self.assertEqual(generate_image_structured.call_count, 2)
+        prompt = generate_image_structured.call_args.args[0]
+        self.assertIn("1536x1024", prompt)
+        self.assertIn("3:2", prompt)
+
+    @mock.patch("gemini_web2api.server._actual_image_size",
+                side_effect=[(2, 2), (3, 3)])
+    @mock.patch("gemini_web2api.server.download_generated_image",
+                return_value=(_png_bytes(2, 2), "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_generation_omits_size_when_outputs_disagree(
+        self, generate_image_structured, _full_size, _download, _actual
+    ):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
+        )
+        status, _, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "model": "gpt-image-1", "n": 2,
+        })
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["data"]), 2)
+        self.assertNotIn("size", payload)
+        self.assertEqual(generate_image_structured.call_count, 2)
+        for call in generate_image_structured.call_args_list:
+            self.assertGreater(call.kwargs["budget_sec"], 0)
+
+    @mock.patch("gemini_web2api.server.fit_image_size",
+                side_effect=ImageOpsUnavailable("no magick"))
+    @mock.patch("gemini_web2api.server.download_generated_image",
+                return_value=(_png_bytes(64, 32), "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_generation_echoes_actual_size_when_resize_is_unavailable(
+        self, generate_image_structured, _full_size, _download, _fit
+    ):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
+        )
+        status, _, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "model": "gpt-image-1",
+            "size": "1536x1024",
+        })
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["size"], "64x32")
+        self.assertNotEqual(payload["size"], "1536x1024")
+
+    def test_image_edit_accepts_compat_fields_with_single_image(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generated = GenerationResult(
             images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
         )
-        with mock.patch(
+        source = _png_bytes(2, 2)
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_context_crop": False,
+            "image_edit_locator": False,
+        }), mock.patch(
             "gemini_web2api.server.upload_image", return_value="/uploaded/source"
+        ) as upload_image, mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(source, "image/png"),
+        ):
+            status, headers, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={
+                    "prompt": "edit this", "model": "gpt-image-1",
+                    "stream": "false", "safety_identifier": "user-1",
+                    "partial_images": "1",
+                },
+                files={"image": ("source.png", source, "image/png")},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(upload_image.call_count, 1)
+        file_refs = generate_image_structured.call_args.kwargs["file_refs"]
+        self.assertEqual(file_refs, [("/uploaded/source", "source.png")])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+
+    def test_image_edit_rejects_multiple_multipart_images(self):
+        source = _png_bytes(2, 2)
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this", "model": "gpt-image-1"},
+            files={"image": [
+                ("one.png", source, "image/png"),
+                ("two.png", source, "image/png"),
+            ]},
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "image")
+        self.assertEqual(error["code"], "unsupported_value")
+
+    def test_image_edit_rejects_multiple_json_images(self):
+        source = _png_bytes(2, 2)
+        data_url = "data:image/png;base64," + base64.b64encode(source).decode()
+        status, _, body = self.post_json("/v1/images/edits", {
+            "prompt": "edit this", "model": "gpt-image-1",
+            "images": [{"image_url": data_url}, {"image_url": data_url}],
+        })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "images")
+        self.assertEqual(error["code"], "unsupported_value")
+
+    def test_image_edit_rejects_markup_in_multipart(self):
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, headers, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={
+                    "prompt": "edit this",
+                    "model": "gpt-image-1",
+                    "markup": "data:image/png;base64,AAAA",
+                },
+                files={"image": ("source.png", _png_bytes(2, 2), "image/png")},
+            )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "markup")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertIn("not supported", error["message"])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+        generate.assert_not_called()
+
+    def test_image_edit_rejects_markup_in_json(self):
+        source = _png_bytes(2, 2)
+        data_url = "data:image/png;base64," + base64.b64encode(source).decode()
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, _, body = self.post_json("/v1/images/edits", {
+                "prompt": "edit this",
+                "model": "gpt-image-1",
+                "images": [{"image_url": data_url}],
+                "markup": data_url,
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "markup")
+        self.assertEqual(error["code"], "unsupported_value")
+        generate.assert_not_called()
+
+    def test_image_edit_rejects_file_id_image_reference(self):
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, headers, body = self.post_json("/v1/images/edits", {
+                "prompt": "edit this", "model": "gpt-image-1",
+                "images": [{"file_id": "file-abc123"}],
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "images[0]")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertIn("image_url", error["message"])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+        generate.assert_not_called()
+
+    def test_image_edit_rejects_file_id_mask_reference(self):
+        source = _png_bytes(2, 2)
+        data_url = "data:image/png;base64," + base64.b64encode(source).decode()
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, _, body = self.post_json("/v1/images/edits", {
+                "prompt": "edit this", "model": "gpt-image-1",
+                "images": [{"image_url": data_url}],
+                "mask": {"file_id": "file-mask123"},
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "mask")
+        self.assertEqual(error["code"], "unsupported_value")
+        self.assertIn("image_url", error["message"])
+        generate.assert_not_called()
+
+    def test_image_generation_requires_model(self):
+        status, _, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox",
+        })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "model")
+        self.assertEqual(error["code"], "missing_required_parameter")
+
+    def test_image_generation_rejects_unknown_model(self):
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, headers, body = self.post_json("/v1/images/generations", {
+                "prompt": "a red fox", "model": "not-a-real-model",
+            })
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "model")
+        self.assertEqual(error["code"], "model_not_found")
+        self.assertIn("not-a-real-model", error["message"])
+        self.assertTrue(headers.get("x-request-id", "").startswith("req_"))
+        generate.assert_not_called()
+
+    def test_image_edit_rejects_unknown_model(self):
+        with mock.patch("gemini_web2api.server.generate_image_structured") as generate:
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "edit this", "model": "not-a-real-model"},
+                files={"image": ("source.png", _png_bytes(2, 2), "image/png")},
+            )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "model")
+        self.assertEqual(error["code"], "model_not_found")
+        generate.assert_not_called()
+
+    def test_image_model_namespace(self):
+        from gemini_web2api.server import _image_model_error, _parse_json_edit_request
+        self.assertIsNone(_image_model_error("gpt-image-1"))
+        self.assertIsNone(_image_model_error("gpt-image-2.5-flare"))
+        self.assertIsNone(_image_model_error("gemini-3.6-flash"))
+        self.assertIsNone(_image_model_error("gemini-3.6-flash@think=4"))
+        self.assertIsNone(_image_model_error("a" * 16))
+        self.assertIsNotNone(_image_model_error("not-a-real-model"))
+        source = _png_bytes(2, 2)
+        data_url = "data:image/png;base64," + base64.b64encode(source).decode()
+        parsed = _parse_json_edit_request(json.dumps({
+            "prompt": "edit this", "images": [{"image_url": data_url}],
+        }).encode())
+        self.assertEqual(parsed["model"], "gpt-image-2.5-sunburst")
+
+    def test_image_edit_requires_model_and_rejects_style(self):
+        source = _png_bytes(2, 2)
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this"},
+            files={"image": ("source.png", source, "image/png")},
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "model")
+        self.assertEqual(error["code"], "missing_required_parameter")
+
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this", "model": "gpt-image-1",
+                    "style": "vivid"},
+            files={"image": ("source.png", source, "image/png")},
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "style")
+        self.assertEqual(error["code"], "unknown_parameter")
+
+    def test_image_edit_rejects_gif_and_bmp_inputs(self):
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this", "model": "gpt-image-1"},
+            files={"image": ("source.gif", b"GIF89a" + b"\x00" * 32, "image/gif")},
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["param"], "image")
+        self.assertIn("PNG, JPEG, or WebP", error["message"])
+
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this", "model": "gpt-image-1"},
+            files={"image": ("source.bmp", b"BM" + b"\x00" * 32, "image/bmp")},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["param"], "image")
+
+    def test_image_edit_accepts_json_image_references(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2)
+        data_url = "data:image/png;base64," + base64.b64encode(source).decode()
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_context_crop": False,
+            "image_edit_locator": False,
+        }), mock.patch(
+            "gemini_web2api.server.upload_image", return_value="/uploaded/source"
+        ) as upload_image, mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
         ), mock.patch(
             "gemini_web2api.server.get_full_size_image", return_value=None
         ), mock.patch(
             "gemini_web2api.server.download_generated_image",
-            return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
+            return_value=(source, "image/png"),
+        ):
+            status, _, body = self.post_json("/v1/images/edits", {
+                "prompt": "edit this", "model": "gpt-image-1",
+                "images": [{"image_url": data_url}],
+            })
+        self.assertEqual(status, 200)
+        self.assertIn("b64_json", json.loads(body)["data"][0])
+        self.assertEqual(upload_image.call_args.args[0], source)
+        self.assertEqual(upload_image.call_args.args[1], "image-0.png")
+
+    def test_image_edit_supports_multiple_outputs(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = _png_bytes(2, 2)
+        with mock.patch.dict(CONFIG, {
+            "image_edit_crop": False, "image_edit_context_crop": False,
+            "image_edit_locator": False,
+        }), mock.patch(
+            "gemini_web2api.server.upload_image", return_value="/uploaded/source"
+        ), mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(source, "image/png"),
         ):
             status, _, body = self.post_multipart(
                 "/v1/images/edits",
-                fields={"prompt": "make it brighter", "response_format": "url"},
-                files={"image": ("source.png", b"\x89PNG\r\n\x1a\nsource", "image/png")},
+                fields={"prompt": "edit this", "model": "gpt-image-1", "n": "2"},
+                files={"image": ("source.png", source, "image/png")},
             )
-
         self.assertEqual(status, 200)
-        returned_url = json.loads(body)["data"][0]["url"]
-        self.assertTrue(returned_url.startswith("data:image/png;base64,"))
-        self.assertNotIn("googleusercontent.com", returned_url)
+        self.assertEqual(len(json.loads(body)["data"]), 2)
+        self.assertEqual(generate_image_structured.call_count, 2)
 
     @mock.patch(
         "gemini_web2api.server.download_generated_image",
@@ -1438,14 +2067,16 @@ class StreamingEndpointTests(unittest.TestCase):
             body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
             body.extend(str(value).encode())
             body.extend(b"\r\n")
-        for name, (filename, data, mime) in (files or {}).items():
-            body.extend(f"--{boundary}\r\n".encode())
-            body.extend(
-                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode()
-            )
-            body.extend(f"Content-Type: {mime}\r\n\r\n".encode())
-            body.extend(data)
-            body.extend(b"\r\n")
+        for name, value in (files or {}).items():
+            entries = value if isinstance(value, list) else [value]
+            for filename, data, mime in entries:
+                body.extend(f"--{boundary}\r\n".encode())
+                body.extend(
+                    f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode()
+                )
+                body.extend(f"Content-Type: {mime}\r\n\r\n".encode())
+                body.extend(data)
+                body.extend(b"\r\n")
         body.extend(f"--{boundary}--\r\n".encode())
 
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -1698,7 +2329,8 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertIn('"type": "upstream_stream_error"', body)
+        self.assertIn('"type": "server_error"', body)
+        self.assertIn('"code": "upstream_stream_error"', body)
         self.assertIn('"retryable": false', body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 

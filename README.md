@@ -261,6 +261,7 @@ Create `config.json` in the same directory:
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "image_request_budget_sec": 900,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -434,29 +435,70 @@ resp = client.chat.completions.create(
 
 ## Image Output
 
-The modular server supports `POST /v1/images/generations` with `prompt`, `n: 1`, and
-`response_format` set to `b64_json` or `url`. The image route uses Gemini Web's dedicated
-browser request shape and returns one OpenAI-compatible image result. It accepts common
-OpenAI Images options such as `size`, `quality`, `style`, and `background` for client
-compatibility; these options are currently ignored by the Gemini backend. `stream` and
-multiple outputs are not supported.
+The modular server supports `POST /v1/images/generations` with `prompt`, `model`
+(required), `n` (1-10), and `response_format` set to `b64_json`. The image route uses Gemini Web's dedicated
+browser request shape. `size` is validated and translated into an explicit aspect-ratio
+instruction; when ImageMagick is available the returned image is also resized/cropped to
+the requested dimensions. The response reports the actual `size` when it can be
+determined, including when `size` is omitted or `auto`, and the actual `output_format`.
+If ImageMagick is unavailable, the response reports the real returned dimensions rather
+than echoing the requested size. For `n > 1`, the response-level `size` is emitted only
+when every output reports the same actual size; mixed sizes are omitted. `n` is executed
+as n independent upstream generations, so latency and Gemini quota consumption scale
+roughly linearly; there is no seed or batch mode, so visual consistency across outputs is
+not guaranteed. `image_request_budget_sec` (default 900, set `0` to disable) bounds the
+whole Images request, including per-image retries and generated-image downloads. Exhaustion
+returns HTTP 504 with `type=server_error, code=request_timeout`. Responses include a
+proxy-side `usage` estimate: text tokens
+are `ceil(UTF-8 bytes / 4)`, and image tokens are
+`ceil(width/32) * ceil(height/32)` per input attachment or output image. These are
+deterministic estimates, not OpenAI or Gemini tokenizer counts; do not use them for
+billing.
+`model` is required for generations and multipart edits. OpenAI image model names
+(`gpt-image-*`, `chatgpt-image-latest`, and legacy `dall-e-*`) are accepted and mapped to
+the same Gemini image pipeline; Gemini model names and 16-hex upstream IDs are also
+accepted for compatibility but do not change the image backend. Any other name returns
+`model_not_found`. JSON edits default an omitted model to `gpt-image-2.5-sunburst`.
+Other OpenAI Images options such as `quality`, `style`, `moderation`,
+`input_fidelity`, and `safety_identifier` are accepted and validated for client
+compatibility, but the Gemini backend does not apply them. `background=opaque` and
+`background=auto` are accepted as no-ops; `background=transparent` is rejected with
+`unsupported_value` because the service cannot guarantee an alpha channel. `output_compression` is applied when the output is
+encoded as JPEG or WebP through ImageMagick. `stream` is not supported and returns a standard OpenAI error with `param: "stream"`.
+`partial_images` is accepted and range-checked (0-3) for compatibility, but has no
+effect because the backend only returns a final image. All OpenAI-compatible `/v1`
+endpoints return the `ErrorResponse` shape (`type`, `message`, `param`, `code`), and every
+response includes `x-request-id`. Error types follow the HTTP status: 400/422
+`invalid_request_error`, 401 `authentication_error`, 403 `permission_error`, 404
+`invalid_request_error`, 429 `rate_limit_error`, and 5xx `server_error`. Proxy-specific causes
+such as `tool_call_parse_error` and `upstream_temporary_refusal` are reported in `code`;
+`retryable` remains an extra field. `/v1beta/*` keeps the Google-style error object for
+Gemini CLI compatibility.
 
-The modular server also supports `POST /v1/images/edits` with OpenAI's multipart form:
-`image` and `prompt` are required, `mask` is optional, and only `n: 1` is supported.
-The source image and mask are uploaded to Gemini and sent to its dedicated image route;
-when a mask is supplied, it must be a PNG with an alpha channel and the same dimensions
-as the source image. With a mask, source dimensions are currently read from PNG, JPEG, GIF, BMP,
-or WebP inputs. Transparent mask areas are described as the editable region, while
-Gemini is asked to preserve opaque areas. Gemini Web does not expose a separate mask
-parameter, so the service sends the mask as the second attachment and describes this alpha
-contract in the prompt. Images are limited to 10 MiB each. `response_format` accepts
-`b64_json` or `url`, and `url` returns a server-owned data URL. Common options such as
-`size`, `quality`, and `input_fidelity` are accepted for client compatibility but currently
-ignored by Gemini. `stream` and multiple outputs are not supported.
+The modular server also supports `POST /v1/images/edits` with OpenAI's multipart form or
+JSON body. In multipart mode `image`, `prompt`, and `model` are required, and `mask` is optional.
+Exactly one `image` is supported; multi-image edits return a standard
+`unsupported_value` error. JSON edits accept a single-element
+`images: [{"image_url": ...}]` with an HTTPS or base64 data URL. `file_id` references
+are rejected because the service does not implement the OpenAI Files API. `mask` must be
+a PNG with an alpha channel and the same dimensions as the source image. With a mask, source dimensions are read from PNG, JPEG, or WebP inputs. Transparent mask areas are described as the editable region, while Gemini is asked
+to preserve opaque areas. Gemini Web does not expose a separate mask parameter, so the
+service sends the mask as an attachment and describes this alpha contract in the prompt.
+Multipart images are limited to 50 MiB each and masks to 4 MiB; JSON HTTPS downloads
+remain capped at 10 MiB by the remote fetch guard. Prompts are limited to 32000 characters. `response_format` supports `b64_json` only. `url` is rejected with a standard
+`unsupported_value` error because this service does not host generated images. Decode
+`b64_json` and store or serve the bytes in your own application if a public URL is needed.
+`n` (1-10), `size`, and `output_format` are honored subject to the same ImageMagick
+fallback as generations. `quality`, `moderation`, and `input_fidelity` are accepted for compatibility but
+ignored; `background=transparent` is rejected with `unsupported_value`, while
+`background=opaque/auto` is accepted as a no-op. `output_compression` is applied to
+JPEG/WebP output. `markup` is not supported and returns a standard `unsupported_value` error.
+`stream` is not supported; `partial_images` is accepted but has no effect.
 
 ```bash
 curl http://localhost:8081/v1/images/edits \\
   -H "Authorization: Bearer sk-your-key" \\
+  -F "model=gpt-image-1" \\
   -F "image=@source.png" \\
   -F "mask=@mask.png" \\
   -F "prompt=Replace the sky with a sunset" \\
@@ -467,10 +509,11 @@ The Responses API also accepts `{"type": "image_generation"}` in `tools` and ret
 `image_generation_call` containing base64 output. Chat Completions recognizes explicit
 requests such as `generate an image of ...` and returns a Markdown image URL.
 
-Generated image URLs are restricted to validated Google image hosts, with bounded redirects,
-size limits, and image signature checks. The server performs the authenticated media download
-for both response formats: `b64_json` contains image bytes, while `url` contains a server-owned
-`data:image/...;base64,...` URL and never exposes a signed Gemini delivery URL to clients.
+Generated image downloads are restricted to validated Google image hosts, with bounded
+redirects, size limits, and image signature checks. The server performs the authenticated
+media download and returns the bytes in `b64_json`; signed Gemini delivery URLs are never
+exposed to clients. The service does not host generated images, so `response_format=url` is
+not supported.
 
 ## Limitations
 

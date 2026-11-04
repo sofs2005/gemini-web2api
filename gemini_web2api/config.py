@@ -9,6 +9,7 @@ DEFAULT_CONFIG = {
     "retry_delay_sec": 5,
     "retry_delay_max_sec": 30,
     "request_timeout_sec": 300,
+    "image_request_budget_sec": 900,
     "stream_heartbeat_sec": 10,
     "agent_request_budget_sec": 300,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
@@ -65,13 +66,14 @@ _ENV_KEYS = {
     "TEMPORARY_CHATS": "temporary_chats", "RETRY_ATTEMPTS": "retry_attempts",
     "RETRY_DELAY_SEC": "retry_delay_sec", "RETRY_DELAY_MAX_SEC": "retry_delay_max_sec",
     "REQUEST_TIMEOUT_SEC": "request_timeout_sec",
+    "IMAGE_REQUEST_BUDGET_SEC": "image_request_budget_sec",
     "AGENT_REQUEST_BUDGET_SEC": "agent_request_budget_sec",
     "STREAM_HEARTBEAT_SEC": "stream_heartbeat_sec",
     "COOKIE_ROTATION_INTERVAL_SEC": "cookie_rotation_interval_sec",
     "MODEL_CHECK_INTERVAL_SEC": "model_check_interval_sec",
     "MODEL_SNAPSHOT_FILE": "model_snapshot_file",
 }
-_ENV_INT = {"port", "retry_attempts", "retry_delay_sec", "retry_delay_max_sec", "request_timeout_sec", "agent_request_budget_sec", "stream_heartbeat_sec", "cookie_rotation_interval_sec", "model_check_interval_sec"}
+_ENV_INT = {"port", "retry_attempts", "retry_delay_sec", "retry_delay_max_sec", "request_timeout_sec", "image_request_budget_sec", "agent_request_budget_sec", "stream_heartbeat_sec", "cookie_rotation_interval_sec", "model_check_interval_sec"}
 _ENV_BOOL = {"log_requests", "temporary_chats"}
 _ENV_NULLABLE = {"cookie_file", "proxy", "xsrf_token", "auth_user"}
 
