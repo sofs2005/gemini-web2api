@@ -147,22 +147,33 @@ def _current_scope():
 
 
 def fetch_account_models():
-    """Make exactly one HTTP request, without generation, redirects or retries."""
+    """Make exactly one RPC request, without generation, redirects or retries."""
     load_cookie()  # Export metadata must be loaded before building the URL/body.
+    # The exported XSRF token can predate the current web deployment. Fetch the
+    # authenticated page token first; fall back to the export if that fails.
+    try:
+        from .multimodal import _cached_page_tokens
+        page_tokens = _cached_page_tokens(max_age=0, timeout=15)
+    except Exception:
+        page_tokens = {}
     headers = _build_headers()
+    headers["Accept-Encoding"] = "identity"  # urllib does not decode gzip/br/zstd.
     scope = _scope(headers.get("Cookie", ""), CONFIG.get("auth_user"))
-    if not CONFIG.get("xsrf_token"):
+    xsrf_token = page_tokens.get("at") or CONFIG.get("xsrf_token")
+    if not xsrf_token:
         raise ModelResponseError("XSRF token required")
     prefix = _account_prefix()
     params = {"rpcids": RPC_ID, "hl": "en", "rt": "c",
               "_reqid": _next_reqid(),
               "source-path": prefix + "/app", "bl": CONFIG["gemini_bl"]}
+    if page_tokens.get("f_sid"):
+        params["f.sid"] = page_tokens["f_sid"]
     url = ("https://gemini.google.com" + prefix + "/_/BardChatUi/data/batchexecute?"
            + urllib.parse.urlencode(params))
     headers["x-goog-ext-525001261-jspb"] = "[1,null,null,null,null,null,null,null,[4,5,6,8],null,null,null,null,null,null,null]"
     headers["x-goog-ext-73010989-jspb"] = "[0]"
     body = urllib.parse.urlencode({
-        "at": CONFIG["xsrf_token"],
+        "at": xsrf_token,
         "f.req": json.dumps([[[RPC_ID, "[]", None, "generic"]]]),
     }).encode()
     proxy = CONFIG.get("proxy")

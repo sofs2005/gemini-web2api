@@ -18,6 +18,7 @@ mkdir -p "$release/wheelhouse"
 cp "$wheels"/*.whl "$release/wheelhouse/"
 cp "$wheels/runtime-manifest.json" "$release/wheelhouse/"
 cp "$root/deploy/serv00/install-image.sh" "$release/install.sh"
+cp "$root/deploy/serv00/install_wheels.py" "$release/install_wheels.py"
 cp "$root/deploy/image-test/smoke.py" "$release/smoke.py"
 cp "$root/deploy/serv00/build-image-runtime.py" "$release/build-image-runtime.py"
 cp "$root/deploy/serv00/config.production.example.json" "$release/config.example.json"
@@ -32,6 +33,8 @@ wheelhouse = release / "wheelhouse"
 checks = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(wheelhouse.glob("*.whl"))}
 if not any(name.startswith("curl_cffi-0.16.3-") and "freebsd" in name for name in checks):
     raise SystemExit("Missing FreeBSD curl_cffi wheel")
+if not any(name.startswith("cffi-") and "freebsd" in name for name in checks):
+    raise SystemExit("Missing FreeBSD cffi wheel")
 (wheelhouse / "SHA256SUMS.json").write_text(json.dumps(checks, indent=2) + "\n")
 config = json.loads((root / "deploy/image-test/config.example.json").read_text())
 config.update(host="127.0.0.1", port=41748, cookie_file="cookie.json", model_snapshot_file="gemini-models.json",

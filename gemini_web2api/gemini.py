@@ -353,6 +353,22 @@ def _build_headers(session_hash=None, request_uuid=None) -> dict:
     return headers
 
 
+def _refresh_text_tokens():
+    """Refresh the page XSRF token and build id after an upstream 400."""
+    if not CONFIG.get("cookie_file"):
+        return None
+    try:
+        from .multimodal import _cached_page_tokens
+        tokens = _cached_page_tokens(max_age=0)
+    except Exception as exc:
+        log(f"Text token refresh failed: {safe_error_message(exc)}")
+        return None
+    token = tokens.get("at")
+    if token:
+        CONFIG["xsrf_token"] = token
+    return token
+
+
 def _session_hash(model_name: str):
     """Per-model session hash from config, captured from the web UI request headers."""
     return (CONFIG.get("session_hashes") or {}).get(model_name)
@@ -967,6 +983,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     url = _get_url()
     selection = (extra_fields or {}).get("_model_selection")
     headers = _build_headers(selection if selection is not None else session_hash)
+    # urllib does not transparently decode gzip/br/zstd responses.
+    headers["Accept-Encoding"] = "identity"
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
@@ -977,6 +995,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     deadline = started_at + budget_sec if budget_sec is not None else None
     attempts = max(1, max_attempts if max_attempts is not None else CONFIG["retry_attempts"])
     configured_timeout = max(0.001, float(CONFIG["request_timeout_sec"]))
+    refreshed_tokens = False
     budget_label = f"{float(budget_sec):.3f}" if budget_sec is not None else "none"
     log(
         f"upstream_start transport=buffered id={trace_id} "
@@ -1081,6 +1100,19 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             )
             if isinstance(e, (TimeoutError, ConnectionAbortedError, GeminiUpstreamError)):
                 raise
+            if (not refreshed_tokens and getattr(e, "code", None) == 400
+                    and attempt < attempts - 1):
+                token = _refresh_text_tokens()
+                if token:
+                    refreshed_tokens = True
+                    body = _build_payload(
+                        prompt, model_id, think_mode, file_refs, extra_fields,
+                        xsrf_token=token).encode()
+                    url = _get_url()
+                    headers = _build_headers(
+                        selection if selection is not None else session_hash)
+                    headers["Accept-Encoding"] = "identity"
+                    log(f"upstream_token_refresh transport=buffered id={trace_id}")
             if attempt < attempts - 1:
                 delay = _retry_delay(attempt)
                 if deadline is not None and time.monotonic() + delay >= deadline:
@@ -1108,7 +1140,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     url = _get_url()
     selection = (extra_fields or {}).get("_model_selection")
     headers = _build_headers(selection if selection is not None else session_hash)
+    # httpx only decodes encodings whose optional decoders are installed.
+    headers["Accept-Encoding"] = "identity"
     client = _get_httpx_client()
+    refreshed_tokens = False
 
     last_err = None
     request_tag = request_id or uuid.uuid4().hex[:10]
@@ -1181,6 +1216,20 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             # terminal stream error instead.
             if emitted_raw_text or isinstance(e, GeminiUpstreamError):
                 raise
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if (not refreshed_tokens and status_code == 400
+                    and attempt < max(1, CONFIG["retry_attempts"]) - 1):
+                token = _refresh_text_tokens()
+                if token:
+                    refreshed_tokens = True
+                    body = _build_payload(
+                        prompt, model_id, think_mode, file_refs, extra_fields,
+                        xsrf_token=token)
+                    url = _get_url()
+                    headers = _build_headers(
+                        selection if selection is not None else session_hash)
+                    headers["Accept-Encoding"] = "identity"
+                    log(f"upstream_token_refresh transport=stream tag={request_tag}")
             if attempt < max(1, CONFIG["retry_attempts"]) - 1:
                 delay = _retry_delay(attempt)
                 log(

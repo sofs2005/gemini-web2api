@@ -29,15 +29,19 @@ PY
 if [ ! -x .venv/bin/python ]; then
     python3 -m venv .venv
 fi
-.venv/bin/python -m pip install --no-index --find-links "$root/wheelhouse" \
-    -r requirements.txt curl_cffi==0.16.3
+# Install from the verified wheelhouse without consulting pip platform tags.
+# Binary wheels are built for FreeBSD 14.3 and remain ABI-compatible across
+# patch levels (for example _p19), which pip otherwise rejects.
+.venv/bin/python "$root/install_wheels.py" "$root/wheelhouse"
 .venv/bin/python - <<'PY'
+import cffi
 from curl_cffi import Curl
 from curl_cffi.requests.impersonate import DEFAULT_CHROME
 curl = Curl()
 try:
     if curl.impersonate(DEFAULT_CHROME) != 0:
         raise SystemExit("Chrome impersonation unavailable")
+    print("cffi", cffi.__version__)
     print(curl.version().decode())
 finally:
     curl.close()

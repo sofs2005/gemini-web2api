@@ -233,6 +233,7 @@ class PageTokenTests(unittest.TestCase):
                 outgoing = request.call_args.args[0]
                 self.assertEqual(outgoing.full_url, "https://gemini.google.com/u/2/app")
                 self.assertEqual(outgoing.get_header("X-goog-authuser"), "2")
+                self.assertEqual(outgoing.get_header("Accept-encoding"), "identity")
                 self.assertEqual(request.call_args.kwargs["timeout"], 5)
                 self.assertTrue(response.closed)
 

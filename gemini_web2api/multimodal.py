@@ -74,6 +74,7 @@ def _get_page_tokens(timeout=30) -> dict:
                 if close:
                     close()
         else:
+            headers["Accept-Encoding"] = "identity"  # urllib does not decompress.
             req = urllib.request.Request(f"https://gemini.google.com{account_prefix}/app", headers=headers)
             if proxy:
                 opener = urllib.request.build_opener(

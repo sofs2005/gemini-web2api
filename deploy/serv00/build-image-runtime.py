@@ -80,6 +80,9 @@ def main():
     subprocess.run([python, "-m", "pip", "install", "wheel", "setuptools>=77", "cffi>=2.0.0", "certifi>=2024.2.2"], check=True)
     wheels = root / "wheelhouse"
     wheels.mkdir(exist_ok=True)
+    # curl_cffi needs cffi at runtime; build it here so the offline wheelhouse
+    # is complete even when the host platform tag has a patch-level suffix.
+    subprocess.run([python, "-m", "pip", "wheel", "--wheel-dir", str(wheels), "cffi>=2.0.0"], check=True)
     subprocess.run([python, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
                     "--wheel-dir", str(wheels), str(source)], env=environment, check=True)
     built = list(wheels.glob("curl_cffi-0.16.3-*.whl"))

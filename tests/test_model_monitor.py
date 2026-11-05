@@ -296,6 +296,7 @@ class ModelRequestTests(unittest.TestCase):
         opener = mock.Mock()
         opener.open.return_value = io.BytesIO(wire().encode())
         with mock.patch.object(monitor, "load_cookie", side_effect=load_cookie), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens", return_value={}), \
              mock.patch.object(monitor, "_build_headers", return_value={"Cookie": self.cookie}), \
              mock.patch.object(monitor.urllib.request, "build_opener", return_value=opener) as build:
             parsed = monitor.fetch_account_models()
@@ -313,11 +314,28 @@ class ModelRequestTests(unittest.TestCase):
         self.assertIsInstance(build.call_args.args[-1], monitor.NoRedirect)
         self.assertNotIn("StreamGenerate", request.full_url)
 
+    def test_uses_fresh_page_token_and_identity_encoding(self):
+        opener = mock.Mock()
+        opener.open.return_value = io.BytesIO(wire().encode())
+        headers = {"Cookie": self.cookie}
+        with mock.patch.object(monitor, "load_cookie"), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens",
+                        return_value={"at": "page-token", "f_sid": "page-session"}), \
+             mock.patch.object(monitor, "_build_headers", return_value=headers), \
+             mock.patch.object(monitor.urllib.request, "build_opener", return_value=opener):
+            monitor.fetch_account_models()
+        request = opener.open.call_args.args[0]
+        url = urlsplit(request.full_url)
+        self.assertEqual(parse_qs(url.query)["f.sid"], ["page-session"])
+        self.assertEqual(parse_qs(request.data.decode())["at"], ["page-token"])
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+
     def test_http_failure_is_not_retried(self):
         opener = mock.Mock()
         opener.open.side_effect = urllib.error.HTTPError(
             "https://example.invalid", 401, "Unauthorized", {}, io.BytesIO(b""))
         with mock.patch.object(monitor, "load_cookie"), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens", return_value={}), \
              mock.patch.object(monitor, "_build_headers", return_value={"Cookie": self.cookie}), \
              mock.patch.object(monitor.urllib.request, "build_opener", return_value=opener):
             with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -327,6 +345,7 @@ class ModelRequestTests(unittest.TestCase):
 
     def test_missing_cookie_or_token_sends_no_request(self):
         with mock.patch.object(monitor, "load_cookie"), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens", return_value={}), \
              mock.patch.object(monitor, "_build_headers", return_value={}), \
              mock.patch.object(monitor.urllib.request, "build_opener") as build:
             with self.assertRaises(monitor.ModelResponseError):
@@ -334,6 +353,7 @@ class ModelRequestTests(unittest.TestCase):
             build.assert_not_called()
         CONFIG["xsrf_token"] = None
         with mock.patch.object(monitor, "load_cookie"), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens", return_value={}), \
              mock.patch.object(monitor, "_build_headers", return_value={"Cookie": self.cookie}), \
              mock.patch.object(monitor.urllib.request, "build_opener") as build:
             with self.assertRaises(monitor.ModelResponseError):
@@ -345,6 +365,7 @@ class ModelRequestTests(unittest.TestCase):
         opener = mock.Mock()
         opener.open.return_value = io.BytesIO(b"x" * (monitor.MAX_RESPONSE_BYTES + 1))
         with mock.patch.object(monitor, "load_cookie"), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens", return_value={}), \
              mock.patch.object(monitor, "_build_headers", return_value={"Cookie": self.cookie}), \
              mock.patch.object(monitor.urllib.request, "build_opener", return_value=opener) as build:
             with self.assertRaises(monitor.ModelResponseError):

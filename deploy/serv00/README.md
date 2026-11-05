@@ -3,15 +3,15 @@
 There are two native FreeBSD release archives. Neither requires Docker or root access, and neither includes cookies, credentials, or private configuration.
 
 - `gemini-web2api-serv00.tar.gz`: application source for text serving; install dependencies from PyPI.
-- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.3.0-freebsd14.3-amd64-py311.tar.gz`.
+- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.3.1-freebsd14.3-amd64-py311.tar.gz`.
 
-The formal `v1.3.0` release is built by GitHub Actions. A tag push produces the multi-architecture GHCR image (`ghcr.io/meatroll/gemini-web2api:v1.3.0`) and attaches the FreeBSD native archive (`gemini-web2api-serv00-v1.3.0-freebsd14.3-amd64-py311.tar.gz`) plus its SHA256 file to the GitHub Release. Future releases use the same `vX.Y.Z` tag convention.
+The formal `v1.3.1` release is built by GitHub Actions. A tag push produces the multi-architecture GHCR image (`ghcr.io/meatroll/gemini-web2api:v1.3.1`) and attaches the FreeBSD native archive (`gemini-web2api-serv00-v1.3.1-freebsd14.3-amd64-py311.tar.gz`) plus its SHA256 file to the GitHub Release. Future releases use the same `vX.Y.Z` tag convention.
 
 For a new production installation:
 
 ```sh
 mkdir -p ~/gemini-web2api
-tar -xzf gemini-web2api-serv00-v1.3.0-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
+tar -xzf gemini-web2api-serv00-v1.3.1-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
 cd ~/gemini-web2api
 sh install.sh
 cp config.example.json config.json
@@ -20,9 +20,9 @@ cp config.example.json config.json
 sh start.sh
 ```
 
-For upgrades, retain the existing `config.json`, credentials, model snapshot and cache. Install dependencies in a fresh venv, save the previous code and venv, and stop/switch the API under `.keepalive.lock` so cron cannot race the upgrade. Verify the health endpoint reports 1.3.0 and the current public model-list endpoint works. Neither check sends a Gemini generation request. Do not overwrite the active configuration with either example template.
+For upgrades, retain the existing `config.json`, credentials, model snapshot and cache. Install dependencies in a fresh venv, save the previous code and venv, and stop/switch the API under `.keepalive.lock` so cron cannot race the upgrade. Verify the health endpoint reports 1.3.1 and the current public model-list endpoint works. Neither check sends a Gemini generation request. Do not overwrite the active configuration with either example template.
 
-The image release bundles `curl_cffi 0.16.3` statically linked with upstream `libcurl-impersonate 2.2.2` (BoringSSL). Its build applies only FreeBSD architecture detection and libc++ link flags from upstream. `build-image-runtime.py` pins and verifies both source archives, and records the runtime source and wheel hashes. The installer checks the complete release manifest and all wheel hashes before installing. No library compilation is required when deploying the prepared release.
+The image release bundles `curl_cffi 0.16.3`, its `cffi` runtime, and `libcurl-impersonate 2.2.2` (BoringSSL). Its build applies only FreeBSD architecture detection and libc++ link flags from upstream. `build-image-runtime.py` pins and verifies both source archives, and records the runtime source and wheel hashes. The installer checks the complete release manifest and all wheel hashes, then extracts the verified wheels without relying on pip platform-tag matching. This keeps the package compatible with FreeBSD patch levels such as `-p19`. No library compilation is required when deploying the prepared release.
 
 To deploy the image release into an isolated test directory:
 

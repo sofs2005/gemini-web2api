@@ -1,6 +1,14 @@
-# Serv00 native release 1.3.0
+# Serv00 native release 1.3.1
 
-This release packages the modular Python server for FreeBSD 14.3 amd64 with Python 3.11. It includes all 13 dependency wheels and installs without Docker, root access, compilation, or package downloads. `release.json` records the source commit and stable release version; `SHA256SUMS.json` covers every packaged file except itself. The installer verifies those files before installing dependencies.
+This release packages the modular Python server for FreeBSD 14.3 amd64 with Python 3.11. It includes the complete dependency wheelhouse and installs without Docker, root access, compilation, or package downloads. `release.json` records the source commit and stable release version; `SHA256SUMS.json` covers every packaged file except itself. The installer verifies those files before extracting the wheels.
+
+## 1.3.1 fixes
+
+- Buffered text generation now sends `Accept-Encoding: identity`, because urllib does not decompress gzip/br/zstd responses. A 400 from the text endpoint triggers one fresh page-token refresh before retrying, so an expired XSRF token no longer makes every text request fail.
+- The same fresh-token retry is applied to the streaming text path.
+- Model discovery now fetches a fresh page token and uses `Accept-Encoding: identity` before its single RPC. A first start can therefore save a valid model snapshot instead of falling back to legacy routing, which the upstream may reject with `BardErrorInfo`.
+- The offline installer no longer asks pip to match the host's FreeBSD patch-level platform tag. It verifies every wheel hash, safely extracts the verified wheels into the virtual environment, and then imports `cffi`, `curl_cffi`, and Chrome impersonation as an install probe. This accepts wheels built for `freebsd_14_3_release_amd64` on hosts reporting `freebsd_14_3_release_p19_amd64`.
+- The Serv00 wheelhouse now includes the `cffi` runtime (and its `pycparser` dependency), which was missing from the 1.3.0 image archive and broke fresh installations even when the platform tag matched.
 
 ## OpenAI Images conformance
 
@@ -45,6 +53,6 @@ Real Serv00 validation passed for ordinary and SSE image requests with `gemini-3
 
 Use `config.example.json` for a new production deployment. Reserve a TCP port in Serv00 even for loopback, configure authentication, and point `cookie_file` at a private authenticated export. The production template enables daily model checks and five-minute cookie rotation, and limits generation attempts to one. The separate `config.image-test.example.json` disables background upstream requests for controlled validation.
 
-For an existing installation, keep the current `config.json`, authentication export, model snapshot, cache, API keys and tunnel configuration. Save the previous source and virtual environment before replacing them, and stop the API process under the same `.keepalive.lock` used by cron before switching code. Install dependencies into a fresh virtual environment before the switch. Verify the local health endpoint reports version 1.3.0 and that the existing public model-list route is available. No generation request is necessary for these checks.
+For an existing installation, keep the current `config.json`, authentication export, model snapshot, cache, API keys and tunnel configuration. Save the previous source and virtual environment before replacing them, and stop the API process under the same `.keepalive.lock` used by cron before switching code. Install dependencies into a fresh virtual environment before the switch. Verify the local health endpoint reports version 1.3.1 and that the existing public model-list route is available. No generation request is necessary for these checks.
 
 This release targets `python -m gemini_web2api`. The legacy single-file entry point and Cloudflare Worker do not include the new attachment transport.

@@ -442,3 +442,19 @@ OpenAI schema。
 **更新后判定：两个 images 接口的核心请求/响应/错误 schema 已与 OpenAI 2.3.0 对齐；
 全部 OpenAI 兼容 `/v1` 接口的边缘错误也已统一为 `ErrorResponse`。`url` 明确不支持，
 剩余差异均为已声明的后端能力限制或兼容超集。**
+
+## 10. `v1.3.1` 部署补丁
+
+Serv00 实际部署验证发现两个与图片协议无关、但会阻断生产使用的问题：
+
+- 文本 `/v1/chat/completions` 的 buffered 路径使用了过期的页面 XSRF token，上游返回 HTTP 400；同时 urllib 请求声明了 gzip/br/zstd，却不会自动解压响应。
+- 离线包内的 `curl_cffi` wheel 使用 `freebsd_14_3_release_amd64` 标签，而 Serv00 主机报告 `freebsd_14_3_release_p19_amd64`；pip 因此拒绝安装。旧包还缺少 `cffi` 运行时 wheel。
+
+`v1.3.1` 的处理：
+
+- buffered 文本请求改用 `Accept-Encoding: identity`；遇到 400 时刷新页面 token 并重试一次，streaming 路径同样处理。
+- 模型发现也改用 fresh page token + `identity`，避免首次启动因旧 token/压缩响应拿不到模型快照而退回 legacy 路由。
+- 离线安装器在校验全部 wheel 哈希后，直接安全解压已验证 wheel 到 venv，绕过 pip 对 patch-level 平台标签的精确匹配；安装后实际导入 `cffi`、`curl_cffi` 并执行 Chrome impersonation 探测。
+- 构建 wheelhouse 时加入 `cffi` 及 `pycparser`，确保全新安装不需要复用旧 venv。
+
+新增测试覆盖 buffered/streaming 的 fresh token 重试和 `identity` 编码。`v1.3.0` 的 OpenAI Images 行为保持不变。

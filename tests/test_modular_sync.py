@@ -206,6 +206,70 @@ class AuthSyncTests(unittest.TestCase):
             self.assertIn(f"/u/{user}/", request.full_url)
             self.assertIn(f"/u/{user}/", request.get_header("Referer"))
 
+    def test_buffered_text_uses_identity_encoding(self):
+        requests = []
+
+        def urlopen(request, **_kwargs):
+            requests.append(request)
+            return io.BytesIO(b"")
+
+        with mock.patch.object(gemini.urllib.request, "urlopen", side_effect=urlopen):
+            gemini.generate("hello", 1, 4)
+        self.assertEqual(requests[0].get_header("Accept-encoding"), "identity")
+
+    def test_generate_refreshes_export_token_after_400(self):
+        CONFIG.update(retry_attempts=2, retry_delay_sec=0)
+        requests = []
+
+        def urlopen(request, **_kwargs):
+            requests.append(request)
+            if len(requests) == 1:
+                raise gemini.urllib.error.HTTPError(
+                    "https://example.invalid", 400, "bad request", {}, None)
+            return io.BytesIO(b"fresh response")
+
+        with mock.patch.object(gemini.urllib.request, "urlopen", side_effect=urlopen), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens",
+                        return_value={"at": "fresh-token"}), \
+             mock.patch.object(gemini, "_retry_delay", return_value=0), \
+             mock.patch.object(gemini, "extract_response_text", return_value="ok"):
+            self.assertEqual(gemini.generate("hello", 1, 4), "ok")
+
+        self.assertEqual(
+            parse_qs(requests[0].data.decode())["at"], ["first-token"])
+        self.assertEqual(
+            parse_qs(requests[1].data.decode())["at"], ["fresh-token"])
+        for request in requests:
+            self.assertEqual(request.get_header("Accept-encoding"), "identity")
+        self.assertEqual(CONFIG["xsrf_token"], "fresh-token")
+
+    def test_stream_refreshes_export_token_after_400(self):
+        CONFIG.update(retry_attempts=2, retry_delay_sec=0)
+        client = mock.MagicMock()
+        first = mock.MagicMock()
+        first.raise_for_status.side_effect = type(
+            "StatusError", (RuntimeError,), {})()
+        first.raise_for_status.side_effect.response = mock.Mock(status_code=400)
+        first.iter_text.return_value = iter(())
+        second = mock.MagicMock()
+        second.raise_for_status.return_value = None
+        second.iter_text.return_value = iter(())
+        client.stream.return_value.__enter__.side_effect = [first, second]
+
+        with mock.patch.object(gemini, "HAS_HTTPX", True), \
+             mock.patch.object(gemini, "_get_httpx_client", return_value=client), \
+             mock.patch("gemini_web2api.multimodal._cached_page_tokens",
+                        return_value={"at": "fresh-token"}), \
+             mock.patch.object(gemini, "_retry_delay", return_value=0):
+            self.assertEqual(list(gemini.generate_stream("hello", 1, 4)), [])
+
+        first_body = client.stream.call_args_list[0].kwargs["content"]
+        second_body = client.stream.call_args_list[1].kwargs["content"]
+        self.assertEqual(parse_qs(first_body)["at"], ["first-token"])
+        self.assertEqual(parse_qs(second_body)["at"], ["fresh-token"])
+        for call in client.stream.call_args_list:
+            self.assertEqual(call.kwargs["headers"]["Accept-Encoding"], "identity")
+
     def test_stream_uses_export_metadata_before_building_request(self):
         client = mock.MagicMock()
         response = client.stream.return_value.__enter__.return_value
@@ -216,6 +280,7 @@ class AuthSyncTests(unittest.TestCase):
         args, kwargs = client.stream.call_args
         self.assertEqual(parse_qs(kwargs["content"])["at"], ["first-token"])
         self.assertEqual(parse_qs(urlsplit(args[1]).query)["bl"], ["first-build"])
+        self.assertEqual(kwargs["headers"]["Accept-Encoding"], "identity")
         self.assertIn("/u/1/", args[1])
 
     def test_stream_flushes_unterminated_final_line(self):
