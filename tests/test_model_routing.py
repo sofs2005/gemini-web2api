@@ -130,6 +130,19 @@ class DynamicModelTests(unittest.TestCase):
         self.assertEqual(models.resolve_model("gemini-3.1-pro")[0], "gemini-3.1-pro")
         self.assertEqual(models.resolve_model("gemini-4-carbon")[:2], ("gemini-4-carbon", 8))
 
+    def test_renamed_model_id_keeps_old_labels_resolvable(self):
+        self.write_snapshot([promo_row(ARGON_ID, "代码与分析", "Argon", 8, "4 Argon")])
+        self.assertEqual(set(models.get_models()), {"gemini-4-argon"})
+        previous = monitor._read_state(self.state)["snapshot"]
+        renamed = monitor.parse_model_response(wire([promo_row(ARGON_ID, "高难任务", "Carbon", 8, "4 Carbon")]))
+        renamed.update(scope=previous["scope"], checked_at="2026-11-13T00:00:00Z")
+        monitor.carry_known_labels(renamed, previous)
+        monitor._write_state(self.state, {"schema_version": 1, "last_attempt_at": 1, "last_status": "changed",
+                                          "snapshot": renamed, "last_change": None})
+        self.assertEqual(set(models.get_models()), {"gemini-4-carbon"})
+        self.assertEqual(models.resolve_model("gemini-4-carbon")[0], "gemini-4-carbon")
+        self.assertEqual(models.resolve_model("gemini-4-argon")[0], "gemini-4-carbon")
+
     def test_sparse_capacity_field_and_duplicate_names(self):
         self.write_snapshot(tiers=[22])
         header = models.resolve_model("gemini-4-argon")[4]["_model_selection"]["header"]

@@ -76,21 +76,20 @@ def _model_label(row):
 
 
 def _aliases(row, label):
-    """Keep marketing copy and category as resolvable aliases.
+    """Keep marketing copy, category and every historical label as aliases.
 
-    Clients that already pinned `gemini-everyday-help` keep working after the
-    exposed name switches back to `gemini-4-hydrogen`.
+    Clients that already pinned `gemini-everyday-help` or `gemini-4-argon` keep
+    working after upstream renames the same model id.
     """
-    names = []
-    for value in (row.get("display_name"), row.get("category"), label):
-        if isinstance(value, str) and value.strip():
-            slug = _slug(value)
-            if slug:
-                names.append(slug)
+    candidates = [row.get("display_name"), row.get("category"), label]
+    candidates.extend(row.get("known_labels") or ())
     ordered = []
-    for name in names:
-        if name not in ordered:
-            ordered.append(name)
+    for value in candidates:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        slug = _slug(value)
+        if slug and slug not in ordered:
+            ordered.append(slug)
     return ordered
 
 

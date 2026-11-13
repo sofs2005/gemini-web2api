@@ -122,13 +122,44 @@ def compare_models(previous, current):
                "removed": [old[key] for key in sorted(old.keys() - new.keys())],
                "renamed": [], "updated": []}
     for key in sorted(old.keys() & new.keys()):
-        before, after = old[key], new[key]
+        before, after = _without_labels(old[key]), _without_labels(new[key])
         if before == after:
             continue
         change = {"id": key, "before": before, "after": after}
         kind = "renamed" if before["display_name"] != after["display_name"] else "updated"
         changes[kind].append(change)
     return changes
+
+
+def _without_labels(row):
+    return {key: value for key, value in row.items() if key != "known_labels"}
+
+
+def _row_labels(row):
+    labels = {value.strip() for value in (row.get("known_labels") or ())
+              if isinstance(value, str) and value.strip()}
+    for field in ("display_name", "description", "category"):
+        value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            labels.add(value.strip())
+    return labels
+
+
+def carry_known_labels(snapshot, previous):
+    """Accumulate every label an upstream model id has ever been advertised under.
+
+    Google renames models in place (the same id went from "4 Argon" to
+    "4 Carbon") and rolls the rename out gradually, so a client pinned to
+    yesterday's name must keep resolving.
+    """
+    history = {}
+    if previous and previous.get("scope") == snapshot.get("scope"):
+        for row in previous.get("models") or []:
+            if isinstance(row, dict) and isinstance(row.get("id"), str):
+                history[row["id"]] = _row_labels(row)
+    for row in snapshot.get("models") or []:
+        row["known_labels"] = sorted(history.get(row.get("id"), set()) | _row_labels(row))
+    return snapshot
 
 
 def _scope(cookie, auth_user):
@@ -303,7 +334,7 @@ def _perform_check(path, interval, now):
         log("model_check status=" + status, force=True)
         return status
     previous = state.get("snapshot")
-    snapshot = dict(result, checked_at=_utc(now))
+    snapshot = carry_known_labels(dict(result, checked_at=_utc(now)), previous)
     if previous is None or previous["scope"] != snapshot["scope"]:
         status = "baseline"
         state["last_change"] = None
