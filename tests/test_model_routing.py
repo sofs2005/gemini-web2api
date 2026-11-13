@@ -25,6 +25,13 @@ def payload(body):
     return json.loads(json.loads(form["f.req"][0])[1])
 
 
+def promo_row(model_id, promo, category, number, label):
+    """Upstream layout where `display_name` carries marketing copy, not the model name."""
+    item = row(model_id, promo, category, number)
+    item[2] = item[12] = label
+    return item
+
+
 class DynamicModelTests(unittest.TestCase):
     def setUp(self):
         self.original_config = dict(CONFIG)
@@ -103,6 +110,25 @@ class DynamicModelTests(unittest.TestCase):
         self.write_snapshot(new_rows)
         self.assertEqual(set(models.get_models()), {"gemini-4.1-argon"})
         self.assertEqual(models.resolve_model("gemini-argon")[0], "gemini-4.1-argon")
+
+    def test_marketing_copy_is_not_used_as_the_model_name(self):
+        self.write_snapshot([
+            promo_row(FLASH_ID, "Everyday help", "4 Hydrogen", 1, "4 Hydrogen"),
+            promo_row(LITE_ID, "Quick answers", "Flash-Lite", 6, "3.5 Flash-Lite"),
+            promo_row(ARGON_ID, "Most complex work", "Carbon", 8, "4 Carbon"),
+            promo_row(PRO_ID, "Detailed research", "Pro", 3, "3.1 Pro"),
+        ])
+        self.assertEqual(set(models.get_models()),
+                         {"gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-4-carbon", "gemini-3.1-pro"})
+        # Clients already pinned to the promotional slug keep resolving.
+        self.assertEqual(models.resolve_model("gemini-everyday-help")[0], "gemini-4-hydrogen")
+        self.assertEqual(models.resolve_model("gemini-most-complex-work")[0], "gemini-4-carbon")
+        self.assertEqual(models.resolve_model("gemini-detailed-research")[0], "gemini-3.1-pro")
+        # Renamed families still honour the legacy aliases through the mode number.
+        self.assertEqual(models.resolve_model("gemini-3.6-flash")[0], "gemini-4-hydrogen")
+        self.assertEqual(models.resolve_model("gemini-flash-lite")[0], "gemini-3.5-flash-lite")
+        self.assertEqual(models.resolve_model("gemini-3.1-pro")[0], "gemini-3.1-pro")
+        self.assertEqual(models.resolve_model("gemini-4-carbon")[:2], ("gemini-4-carbon", 8))
 
     def test_sparse_capacity_field_and_duplicate_names(self):
         self.write_snapshot(tiers=[22])

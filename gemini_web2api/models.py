@@ -58,6 +58,42 @@ def _slug(value):
     return re.sub(r"[^a-z0-9.]+", "-", value).strip("-")
 
 
+# Upstream has swapped the meaning of two fields once already: at one point
+# `display_name` held the model name ("3.8 Flash") and `description` held the
+# marketing line ("All-around help"); later the marketing line moved into
+# `display_name` ("Everyday help") and the model name into `description`
+# ("4 Hydrogen"). Pick whichever candidate actually looks like a model name
+# instead of trusting a fixed field.
+_MODEL_LABEL = re.compile(r"^\s*\d+(?:\.\d+)?\s+[A-Za-z]")
+
+
+def _model_label(row):
+    for field in ("description", "display_name", "category"):
+        value = row.get(field)
+        if isinstance(value, str) and _MODEL_LABEL.match(value):
+            return value.strip()
+    return (row.get("display_name") or row.get("category") or row.get("id") or "").strip()
+
+
+def _aliases(row, label):
+    """Keep marketing copy and category as resolvable aliases.
+
+    Clients that already pinned `gemini-everyday-help` keep working after the
+    exposed name switches back to `gemini-4-hydrogen`.
+    """
+    names = []
+    for value in (row.get("display_name"), row.get("category"), label):
+        if isinstance(value, str) and value.strip():
+            slug = _slug(value)
+            if slug:
+                names.append(slug)
+    ordered = []
+    for name in names:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
 def _dynamic_models():
     """Read the last valid snapshot for this session without contacting Google."""
     from .config import CONFIG
@@ -70,7 +106,7 @@ def _dynamic_models():
         if not snapshot or snapshot["scope"] != _current_scope():
             return None
         rows = snapshot["models"]
-        names = ["gemini-" + (_slug(row["display_name"]) or _slug(row["id"])) for row in rows]
+        names = ["gemini-" + (_slug(_model_label(row)) or _slug(row["id"])) for row in rows]
         models = {}
         for row, name in zip(rows, names):
             if (type(row.get("number")) is not int or row["number"] < 1
@@ -85,9 +121,12 @@ def _dynamic_models():
             if row["capacity_field"] == 13:
                 header.append(None)
             header.extend([row["capacity"], None, None, row["number"], 1, _SESSION_ID])
+            label = _model_label(row)
+            blurb = row["display_name"] if row["display_name"] and row["display_name"] != label else ""
             models[name] = {"mode": row["number"], "think": 4,
-                            "desc": row["description"] or row["display_name"],
+                            "desc": "%s (%s)" % (label, blurb) if blurb else (label or row["description"]),
                             "category": _slug(row["category"]), "upstream_id": row["id"],
+                            "aliases": _aliases(row, label),
                             "extra": {_SELECTION_KEY: {"header": header, "scope": snapshot["scope"]}}}
         return models
     except (OSError, ValueError, KeyError, TypeError):
@@ -103,7 +142,8 @@ def _find_dynamic_model(name, models):
     if name in models:
         return name
     matches = [key for key, cfg in models.items()
-               if name == cfg["upstream_id"] or name == "gemini-" + cfg["category"]]
+               if name == cfg["upstream_id"] or name == "gemini-" + cfg["category"]
+               or name in ("gemini-" + alias for alias in cfg.get("aliases") or ())]
     if len(matches) == 1:
         return matches[0]
     # A major-version alias is safe only when it identifies one listed model.
@@ -120,6 +160,11 @@ def _find_dynamic_model(name, models):
             matches = [key for key, cfg in models.items() if cfg["category"] == category]
             if len(matches) == 1:
                 return matches[0]
+        # Upstream renames its families ("Flash" -> "4 Hydrogen"), so fall back
+        # to the mode number, which still tracks MODE_CATEGORY one-to-one.
+        matches = [key for key, cfg in models.items() if cfg["mode"] == legacy["mode"]]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
